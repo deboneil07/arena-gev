@@ -1,0 +1,159 @@
+﻿qualifier_id,name,value_format,description,source_status,source
+1,Long ball,,Long pass over 35 yards.,reference,Public Opta F24 reference
+2,Cross,,Ball played from wide areas into the box.,reference,Public Opta F24 reference
+3,Head pass,,Pass made with a player’s head.,reference,Public Opta F24 reference
+4,Through ball,,Ball played through for an attacking run.,reference,Public Opta F24 reference
+5,Free kick taken,,Direct or indirect free kick.,reference,Public Opta F24 reference
+6,Corner taken,,Corner kick.,reference,Public Opta F24 reference
+7,Players caught offside,Player ID,Player in offside position when pass was made.,reference,Public Opta F24 reference
+10,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+13,Foul,,Foul qualifier.,reference,Public Opta F24 reference
+14,Last line,,Defensive action by the last defender.,reference,Public Opta F24 reference
+15,Head,,Player used their head.,reference,Public Opta F24 reference
+16,Small box-centre,,Pitch zone.,reference,Public Opta F24 reference
+17,Box-centre,,Pitch zone.,reference,Public Opta F24 reference
+18,Out of box-centre,,Pitch zone.,reference,Public Opta F24 reference
+20,Right footed,,Shot with right foot.,reference,Public Opta F24 reference
+22,Regular play,,Shot during open play.,reference,Public Opta F24 reference
+23,Fast break,,Shot following fast break.,reference,Public Opta F24 reference
+24,Set piece / Fast Break,,Context-specific reference use.,reference,Public Opta F24 reference
+25,From corner,,Shot from a corner.,reference,Public Opta F24 reference
+29,Assisted,,Pass/assist set up goal opportunity.,reference,Public Opta F24 reference
+30,Involved,Player IDs,Players in starting lineup and available substitutes.,reference,Public Opta F24 reference
+31,Yellow Card,,Player shown yellow card.,reference,Public Opta F24 reference
+41,Injury,,Substitution due to injury.,reference,Public Opta F24 reference
+42,Tactical,,Substitution for tactical reasons.,reference,Public Opta F24 reference
+44,Player position,Dynamic,Playing position for the match.,reference,Public Opta F24 reference
+46,Conditions,1-4,"Wind, rain, fog, snow/hail.",reference,Public Opta F24 reference
+47,Field Pitch,1-5,Pitch condition.,reference,Public Opta F24 reference
+49,Attendance Figure,Dynamic,Number of people in crowd.,reference,Public Opta F24 reference
+55,Related event ID,Event ID,Related event such as an assist event.,reference,Public Opta F24 reference
+56,Zone,Back/Left/Center/Right,Area/zone of the pitch.,reference,Public Opta F24 reference
+57,End type,,End-of-match/end-type qualifier.,reference,Public Opta F24 reference
+59,Jersey number,Shirt number,Player shirt number.,reference,Public Opta F24 reference
+63,Box-right,,Pitch zone.,reference,Public Opta F24 reference
+64,Box-left,,Pitch zone.,reference,Public Opta F24 reference
+65,Box-deep left,,Pitch zone.,reference,Public Opta F24 reference
+72,Left footed,,Shot with left foot.,reference,Public Opta F24 reference
+73,Left,,Hit/missed left side of goal.,reference,Public Opta F24 reference
+74,High,,Hit crossbar or missed over.,reference,Public Opta F24 reference
+75,Right,,Hit/missed right side of goal.,reference,Public Opta F24 reference
+76,Low left,,Goal-mouth zone.,reference,Public Opta F24 reference
+77,High left,,Goal-mouth zone.,reference,Public Opta F24 reference
+78,Low centre,,Goal-mouth zone.,reference,Public Opta F24 reference
+79,High centre,,Goal-mouth zone.,reference,Public Opta F24 reference
+80,Low right,,Goal-mouth zone.,reference,Public Opta F24 reference
+82,Blocked,,Goal-mouth zone.,reference,Public Opta F24 reference
+83,Close left,,Goal-mouth zone.,reference,Public Opta F24 reference
+84,Close right,,Goal-mouth zone.,reference,Public Opta F24 reference
+89,1 on 1,,Attacker clear with no defenders between attacker and goalkeeper.,reference,Public Opta F24 reference
+94,Def block,,Defender blocks an opposition shot.,reference,Public Opta F24 reference
+100,Six yard blocked,,Shot blocked on six-yard line.,reference,Public Opta F24 reference
+101,Saved off line,,Shot saved on goal line.,reference,Public Opta F24 reference
+102,Goal mouth Y co-ordinate,0-100,Y coordinate where shot crossed goal line.,reference,Public Opta F24 reference
+103,Goal mouth Z co-ordinate,0-100,Height coordinate where shot crossed goal line.,reference,Public Opta F24 reference
+107,Throw-in,,Throw-in taken.,reference,Public Opta F24 reference
+108,Volley,,Shot on the volley.,reference,Public Opta F24 reference
+113,Strong,,Shot subjectively classed as strong.,reference,Public Opta F24 reference
+121,Swerve Right,,Shot swerves right from attacker perspective.,reference,Public Opta F24 reference
+123,Keeper Throw,,Goalkeeper throws ball out.,reference,Public Opta F24 reference
+124,Goal Kick,,Goal kick.,reference,Public Opta F24 reference
+127,Direction of play,Right to Left / Left to Right,Actual direction relative to TV camera; coordinates normalized left-to-right.,reference,Public Opta F24 reference
+130,Team formation,Formation ID,Team formation ID.,reference,Public Opta F24 reference
+131,Team player formation,1-11,Player position within formation.,reference,Public Opta F24 reference
+133,Deflection,,Shot deflected off another player.,reference,Public Opta F24 reference
+136,Keeper Touched,,Goal where goalkeeper got a touch.,reference,Public Opta F24 reference
+138,Hit Woodwork,,Shot hits post/crossbar.,reference,Public Opta F24 reference
+140,Pass End X,0-100,X pitch coordinate for end point of pass.,reference,Public Opta F24 reference
+141,Pass End Y,0-100,Y pitch coordinate for end point of pass.,reference,Public Opta F24 reference
+144,Deleted event type,Event type,ID of event that should be removed.,reference,Public Opta F24 reference
+145,Formation slot,1-11,Formation position of player coming on.,reference,Public Opta F24 reference
+146,Blocked X co-ordinate,0-100,X pitch coordinate where shot was blocked.,reference,Public Opta F24 reference
+147,Blocked Y co-ordinate,0-100,Y pitch coordinate where shot was blocked.,reference,Public Opta F24 reference
+152,Direct,,Used with a free kick.,reference,Public Opta F24 reference
+153,Not past goal line,,Shot missed but did not pass goal line.,reference,Public Opta F24 reference
+154,Intentional assist,,Shot from an intentional assist.,reference,Public Opta F24 reference
+155,Chipped,,Pass chipped into the air.,reference,Public Opta F24 reference
+156,Lay-off,,Player lays ball into teammate run.,reference,Public Opta F24 reference
+157,Launch,,"Pass from own half toward front players, aimed at a zone.",reference,Public Opta F24 reference
+160,Throw-in set piece,,Shot came from throw-in set piece.,reference,Public Opta F24 reference
+167,Out of play,,Tackle/clearance sent ball out of play.,reference,Public Opta F24 reference
+168,Flick-on,,Player flicked ball forward using head.,reference,Public Opta F24 reference
+169,Leading to attempt,,Player error leading to opponent shot.,reference,Public Opta F24 reference
+173,Parried safe,,Keeper save parried to safety.,reference,Public Opta F24 reference
+177,Collected,,Keeper save and collects possession.,reference,Public Opta F24 reference
+178,Standing,,Keeper save while standing.,reference,Public Opta F24 reference
+179,Diving,,Keeper save while diving.,reference,Public Opta F24 reference
+182,Hands,,Keeper save with hands; reference says replaced by 267-272.,reference,Public Opta F24 reference
+183,Feet,,Keeper save with feet; reference says replaced by 267-272.,reference,Public Opta F24 reference
+185,Blocked cross,,Clearance where cross is blocked.,reference,Public Opta F24 reference
+189,Player not visible,,Replay/non-live footage; analyst believes event occurred.,reference,Public Opta F24 reference
+194,Captain,Player ID,ID of team captain.,reference,Public Opta F24 reference
+196,Switch of play,,Pass crosses centre zone and exceeds specified length threshold.,reference,Public Opta F24 reference
+197,Team kit,Kit ID,Team kit ID.,reference,Public Opta F24 reference
+198,GK hoof,,Keeper drops ball and kicks it long toward a position.,reference,Public Opta F24 reference
+209,Game end,,Game is finished.,reference,Public Opta F24 reference
+210,Assist,,Pass was an assist for a shot.,reference,Public Opta F24 reference
+211,Overrun,,Take-on where ball runs away to opponent/out.,reference,Public Opta F24 reference
+212,Length,Dynamic - yards of pitch,Estimated length ball travelled.,reference,Public Opta F24 reference
+213,Angle,0-6.28 radians,Angle of ball travel relative to direction of play.,reference,Public Opta F24 reference
+214,Big Chance,,Excellent/clear-cut opportunity.,reference,Public Opta F24 reference
+215,Individual Play,,Player created chance to shoot alone.,reference,Public Opta F24 reference
+216,2nd related event ID,Event ID,Related event ID for second assist.,reference,Public Opta F24 reference
+217,2nd assisted,,Significant pass creating opportunity for assist.,reference,Public Opta F24 reference
+218,2nd assist,,Pass deemed a second assist.,reference,Public Opta F24 reference
+223,In-swinger,,Corner swerving toward goal.,reference,Public Opta F24 reference
+224,Out-swinger,,Corner swerving away from goal.,reference,Public Opta F24 reference
+227,Resume,,Game resumed after suspension.,reference,Public Opta F24 reference
+229,Post-match complete,,Post-match quality control completed.,reference,Public Opta F24 reference
+230,GK X Coordinate,,Keeper X position when goal/shot hit post.,reference,Public Opta F24 reference
+231,GK Y Coordinate,,Keeper Y position when goal/shot hit post.,reference,Public Opta F24 reference
+233,Opposite related event ID,Event ID,Links corresponding events for both teams.,reference,Public Opta F24 reference
+236,Blocked Pass,,Pass blocked by nearby defender; distinct from interception.,reference,Public Opta F24 reference
+237,Low,,Low goal kick.,reference,Public Opta F24 reference
+241,Indirect,,Indirect free kick.,reference,Public Opta F24 reference
+255,Open Roof,Dynamic,Whether stadium roof is open.,reference,Public Opta F24 reference
+256,Air Humidity,Dynamic,Air humidity.,reference,Public Opta F24 reference
+257,Air Pressure,Dynamic,Air pressure.,reference,Public Opta F24 reference
+259,Celsius degrees,Dynamic,Temperature.,reference,Public Opta F24 reference
+264,Aerial Foul,,Foul committed aerially.,reference,Public Opta F24 reference
+265,Attempted Tackle,,Foul committed by attempted tackle.,reference,Public Opta F24 reference
+273,Hit Right Post,,Hit right post after save.,reference,Public Opta F24 reference
+275,Hit Bar,,Hit bar after save.,reference,Public Opta F24 reference
+277,Minutes,,Minutes of injury time given by referee.,reference,Public Opta F24 reference
+279,Kick Off,,Starting pass; used to exclude kickoff from passing percentage.,reference,Public Opta F24 reference
+285,Defensive,,Indicates defensive duel.,reference,Public Opta F24 reference
+286,Offensive,,Indicates offensive duel.,reference,Public Opta F24 reference
+287,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+292,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+293,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+294,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+295,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+302,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+319,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+328,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+345,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+346,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+347,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+361,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+363,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+374,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+375,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+376,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+377,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+378,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+383,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+384,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+385,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+388,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+389,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+391,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+393,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+395,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+396,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+399,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+458,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+464,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+465,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+468,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+492,Unknown / not mapped,,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference

@@ -1,0 +1,39 @@
+﻿type_id,name,description,source_status,source
+1,Pass,Any pass attempted from one player to another.,reference,Public Opta F24 reference
+2,Offside Pass,Attempted pass made to a player in an offside position.,reference,Public Opta F24 reference
+3,Take On,Attempted dribble past an opponent.,reference,Public Opta F24 reference
+4,Foul,Foul committed resulting in a free kick.,reference,Public Opta F24 reference
+5,Out,Ball goes out of play for a throw-in or goal kick.,reference,Public Opta F24 reference
+6,Corner Awarded,Ball goes out of play for a corner kick.,reference,Public Opta F24 reference
+7,Tackle,Tackle that dispossesses an opponent.,reference,Public Opta F24 reference
+8,Interception,Intercepts an opposition pass and prevents it reaching its target.,reference,Public Opta F24 reference
+10,Save,Goalkeeper saves a shot on goal.,reference,Public Opta F24 reference
+12,Clearance,Player hits the ball clear of the defensive zone and/or out of play.,reference,Public Opta F24 reference
+13,Miss,Shot on goal goes wide or over.,reference,Public Opta F24 reference
+15,Attempt Saved,Shot saved; event is for the player who made the shot.,reference,Public Opta F24 reference
+16,Goal,All goals.,reference,Public Opta F24 reference
+17,Card,Booking/card event.,reference,Public Opta F24 reference
+18,Player off,Player is substituted off.,reference,Public Opta F24 reference
+19,Player on,Player comes on as a substitute.,reference,Public Opta F24 reference
+24,Condition change,Change in playing conditions.,reference,Public Opta F24 reference
+30,End,End of a match period.,reference,Public Opta F24 reference
+32,Start,Start of a match period.,reference,Public Opta F24 reference
+34,Team set up,Team lineup/setup; qualifiers contain lineup/formation information.,reference,Public Opta F24 reference
+37,Collection End,Signals the end of data collection.,reference,Public Opta F24 reference
+40,Formation change,Team alters its formation.,reference,Public Opta F24 reference
+41,Punch,Goalkeeper punches the ball clear.,reference,Public Opta F24 reference
+43,Deleted event,Event has been deleted and is resent as type 43.,reference,Public Opta F24 reference
+44,Aerial,Aerial duel; outcome represents won/lost.,reference,Public Opta F24 reference
+45,Challenge,Player fails to win the ball while opponent dribbles past.,reference,Public Opta F24 reference
+49,Ball recovery,Team wins possession and keeps it for at least two passes or an attacking play.,reference,Public Opta F24 reference
+50,Dispossessed,Player is successfully tackled and loses possession.,reference,Public Opta F24 reference
+51,Error,Player mistake losing the ball; can lead to a shot/goal.,reference,Public Opta F24 reference
+52,Keeper pick-up,Goalkeeper picks up the ball.,reference,Public Opta F24 reference
+55,Offside provoked,Awarded to last defender when offside is given against attacker.,reference,Public Opta F24 reference
+56,Shield ball opp,Defender shields ball from opponent as it rolls out.,reference,Public Opta F24 reference
+59,Keeper Sweeper,Keeper comes off line/box to clear ball.,reference,Public Opta F24 reference
+61,Ball touch,Bad touch/control event; outcome distinguishes result.,reference,Public Opta F24 reference
+70,Injury Time Announcement,Injury time awarded by referee.,reference,Public Opta F24 reference
+74,Blocked Pass,Defender close to possession blocks a pass; distinct from interception.,reference,Public Opta F24 reference
+80,Unknown / not mapped,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
+83,Unknown / not mapped,No mapping found in the public reference used for this build.,unknown,Public Opta F24 reference
