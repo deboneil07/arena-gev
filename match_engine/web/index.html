@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>God's Eye View — Opta F24 Simulation</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 50% 0%, #16202b 0%, #0d1117 70%);
+      color: #c9d1d9;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      padding: 16px 20px;
+      min-height: 100vh;
+    }
+    h1 { font-size: 18px; font-weight: 600; margin: 0 0 8px; letter-spacing: 0.4px; text-align: center; }
+    #hud { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; justify-content: center;
+           margin: 0 0 10px; font-size: 13px; color: #8b949e; }
+    #hud strong { color: #e6edf3; font-variant-numeric: tabular-nums; }
+    #controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; margin-bottom: 12px; }
+    button, label.file {
+      background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px;
+      padding: 6px 12px; font-size: 13px; cursor: pointer; transition: background 120ms ease;
+    }
+    button:hover, label.file:hover { background: #30363d; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    input[type="file"] { display: none; }
+    input[type="text"] { background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+      border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+    input[type="range"] { accent-color: #2f81f7; }
+    #filelist { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; margin-bottom: 8px; }
+    #filelist button {
+      background: #161b22; color: #58a6ff; border: 1px solid #30363d; border-radius: 6px;
+      padding: 5px 10px; font-size: 12px; cursor: pointer;
+    }
+    #filelist button:hover { background: #21262d; border-color: #58a6ff; }
+    #status { min-height: 1.2em; font-size: 12px; color: #f85149; margin-bottom: 8px; text-align: center; }
+
+    /* Scoreboard + possession */
+    #scoreboard { display: flex; align-items: center; gap: 10px; background: #161b22;
+      border: 1px solid #21262d; border-radius: 8px; padding: 4px 14px; }
+    #score { font-size: 18px; font-weight: 700; letter-spacing: 1px; color: #e6edf3;
+      font-variant-numeric: tabular-nums; }
+    #possbar { display: inline-flex; width: 120px; height: 8px; border-radius: 4px;
+      overflow: hidden; background: #21262d; vertical-align: middle; margin: 0 6px; }
+    #possbar i { display: block; height: 100%; }
+    #posshome { background: #f2f2f2; }
+    #possaway { background: #2f81f7; }
+
+    /* Layout: pitch on the left, event panel on the right. */
+    #app { display: flex; gap: 18px; align-items: flex-start; justify-content: center; flex-wrap: wrap; }
+    #stage { position: relative; display: inline-block; max-width: 100%; }
+    #gev-canvas {
+      background: #1e3822;
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+      border-radius: 6px;
+      display: block;
+      max-width: 100%;
+      height: auto;
+    }
+    /* Centre splash for big moments (inside the pitch). */
+    #splash {
+      position: absolute; top: 36%; left: 50%; transform: translate(-50%, -50%) scale(0.9);
+      padding: 14px 30px; border-radius: 10px;
+      background: rgba(13, 17, 23, 0.9);
+      border: 2px solid #2f81f7;
+      color: #e6edf3; font-size: 30px; font-weight: 800; letter-spacing: 1px;
+      text-transform: uppercase; text-align: center; white-space: nowrap;
+      opacity: 0; pointer-events: none;
+      transition: opacity 220ms ease, transform 220ms ease;
+      text-shadow: 0 2px 12px rgba(0, 0, 0, 0.8);
+    }
+    #splash.show { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    #splash .who { display: block; font-size: 14px; font-weight: 600; letter-spacing: 0.5px;
+      text-transform: none; color: #8b949e; margin-top: 4px; }
+
+    /* Event panel OUTSIDE the map. */
+    #sidebar {
+      width: 300px; max-width: 100%;
+      background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
+      padding: 12px; align-self: stretch;
+      display: flex; flex-direction: column;
+      height: 680px; max-height: 80vh;
+    }
+    #sidebar h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px;
+      color: #8b949e; margin: 0 0 10px; font-weight: 600; }
+    #feed { display: flex; flex-direction: column; gap: 4px; overflow: hidden; flex: 1; }
+    #feed .row {
+      display: flex; gap: 8px; align-items: center;
+      background: #161b22; border-left: 3px solid #30363d; border-radius: 0 4px 4px 0;
+      padding: 5px 9px; font-size: 12.5px;
+      animation: feedIn 180ms ease;
+    }
+    #feed .row.home { border-left-color: #f2f2f2; }
+    #feed .row.away { border-left-color: #2f81f7; }
+    #feed .row.notable { background: rgba(47, 129, 247, 0.18); font-weight: 600; }
+    #feed .t { color: #8b949e; font-variant-numeric: tabular-nums; min-width: 34px; }
+    #feed .lbl { color: #e6edf3; }
+    #feed .row.home .lbl::before { content: "🏠 "; }
+    #feed .row.away .lbl::before { content: "✈ "; }
+    @keyframes feedIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: none; } }
+
+    /* Match browser panel (left column, scrollable). */
+    #match-browser {
+      width: 240px; max-width: 100%;
+      background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
+      padding: 12px; align-self: stretch;
+      display: flex; flex-direction: column;
+      max-height: 680px; max-height: 80vh;
+    }
+    #match-browser h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px;
+      color: #8b949e; margin: 0 0 10px; font-weight: 600; }
+    #match-list { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; flex: 1; }
+    #match-list::-webkit-scrollbar { width: 8px; }
+    #match-list::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+    #match-list::-webkit-scrollbar-track { background: transparent; }
+    .match-card {
+      background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+      padding: 8px 10px; cursor: pointer;
+      transition: border-color 120ms ease, background 120ms ease;
+    }
+    .match-card:hover { background: #21262d; border-color: #58a6ff; }
+    .match-card.active { border-color: #2f81f7; background: rgba(47,129,247,0.14); }
+    .match-card .fixture { font-size: 13px; font-weight: 600; color: #e6edf3; }
+    .match-card .meta { font-size: 11px; color: #8b949e; margin-top: 3px; }
+    #match-list .empty { font-size: 12px; color: #8b949e; padding: 8px 2px; }
+
+    #teams { font-size: 14px; }
+    #teams em { color: #8b949e; font-style: normal; margin: 0 4px; }
+    #match-info { color: #8b949e; font-size: 12px; }
+
+    .legend { display: flex; gap: 16px; font-size: 12px; color: #8b949e; margin-top: 10px; justify-content: center; }
+    .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: middle; border: 1px solid #000; }
+  </style>
+</head>
+<body>
+  <h1>⚽ God's Eye View — Opta F24 Simulation</h1>
+  <div id="hud">
+    <span class="scoreboard-wrap">
+      <span id="teams"><strong id="homename">Home</strong><em>vs</em><strong id="awayname">Away</strong></span>
+      <span id="scoreboard"><strong id="score">0 – 0</strong></span>
+    </span>
+    <span id="match-info">—</span>
+    <span>Match Time <strong id="timer">00:00</strong></span>
+    <span>Possession <span id="possbar"><i id="posshome" style="width:50%"></i><i id="possaway" style="width:50%"></i></span><strong id="possval">50%</strong></span>
+    <span>Sim <strong id="fps">—</strong> FPS</span>
+    <span>Ball Alt <strong id="altitude">0.0</strong> m</span>
+  </div>
+  <div id="controls">
+    <button id="back10">⏪ 10 min</button>
+    <button id="playpause">⏸ Pause</button>
+    <button id="fwd10">⏩ 10 min</button>
+    <button id="restart" disabled>↺ Restart</button>
+    <label class="file">📂 Load XML<input type="file" id="file" accept=".xml,text/xml" /></label>
+    <label>Speed
+      <input type="range" id="speed" min="0.25" max="8" step="0.25" value="1" />
+      <span id="speedval">1.00×</span>
+    </label>
+    <label>XML path
+      <input type="text" id="xmlpath" placeholder="my_match.xml" size="16" />
+    </label>
+    <button id="loadpath">Load path</button>
+    <button id="browse" title="Pick a folder and choose an .xml from it">📁 Browse folder</button>
+  </div>
+  <div id="filelist"></div>
+  <div id="status"></div>
+
+  <div id="app">
+    <aside id="match-browser">
+      <h2>Matches</h2>
+      <div id="match-list"></div>
+    </aside>
+    <div id="stage">
+      <canvas id="gev-canvas" width="1050" height="680"></canvas>
+      <div id="splash"></div>
+    </div>
+    <aside id="sidebar">
+      <h2>Live Events</h2>
+      <div id="feed"></div>
+    </aside>
+  </div>
+
+  <div class="legend">
+    <span><i class="swatch" style="background:#f2f2f2"></i>Home</span>
+    <span><i class="swatch" style="background:#2f81f7"></i>Away</span>
+    <span><i class="swatch" style="background:#ffea00"></i>Ball</span>
+  </div>
+
+  <script type="module" src="./app.js?v=2"></script>
+</body>
+</html>

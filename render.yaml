@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: arena-gev
+    env: docker
+    plan: starter
+    # The Dockerfile at the repo root builds the Rust WASM engine and
+    # serves match_engine/web/ as a static site through Caddy.

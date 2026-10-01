@@ -1,25 +1,9 @@
-# Python
-__pycache__/
-*.py[cod]
+# Command Code local session / tool state
+.commandcode/
 
-# Virtual environments
-venv/
-.venv/
-env/
-
-# IDE
-.vscode/
-
-# OS
+# OS / editor cruft
 .DS_Store
 Thumbs.db
-
-# Python cache
-.pytest_cache/
-
-# Generated reports
-output/
-
-# Temporary files
-*.tmp
-*.log
+*.swp
+.vscode/
+.idea/

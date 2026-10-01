@@ -1,0 +1,11 @@
+# Rust build artifacts
+/target
+
+# wasm-bindgen output (current: web/pkg, legacy: pkg)
+/web/pkg
+/pkg
+/pkg-node
+
+# Fixture copies + generated manifest placed under web/
+/web/matches/
+/web/matches.json

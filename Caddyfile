@@ -1,0 +1,10 @@
+{
+	auto_https off
+	admin off
+}
+
+# Listen on the port Render injects via the PORT environment variable.
+:{$PORT} {
+	root * /usr/share/caddy
+	file_server
+}
