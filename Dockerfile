@@ -31,7 +31,18 @@ RUN cargo run --release --example gen_manifest
 
 # ---- Serve the static web app ----
 FROM caddy:alpine
+# Render's container runtime refuses to exec a binary that carries
+# file capabilities, failing with "exec /usr/bin/caddy: operation not
+# permitted". The official caddy image sets cap_net_bind_service on the
+# binary so it can bind privileged ports as non-root. We only serve on
+# the high port Render injects via $PORT, so strip the capability.
+RUN apk add --no-cache libcap-setcap && setcap -r /usr/bin/caddy
 COPY --from=builder /src/web /usr/share/caddy
 COPY Caddyfile /etc/caddy/Caddyfile
 # Render sets PORT at runtime; Caddy listens on it via the Caddyfile.
 ENV PORT=80
+# Invoke caddy directly. Clearing the base image's ENTRYPOINT and
+# spelling out the full command guarantees the process is started
+# exactly as written, which is what Render's runtime expects.
+ENTRYPOINT []
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
