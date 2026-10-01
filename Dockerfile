@@ -9,6 +9,7 @@ COPY match_engine/src ./src
 COPY match_engine/examples ./examples
 COPY match_engine/data ./data
 COPY match_engine/tests ./tests
+COPY match_engine/web ./web
 
 # Install the wasm-bindgen CLI version pinned by Cargo.lock so the
 # generated bindings match the wasm-bindgen crate used to build the

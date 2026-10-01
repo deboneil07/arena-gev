@@ -1,0 +1,12 @@
+# Keep the Docker build context small and free of build output.
+.git/
+.commandcode/
+
+# Rust build artifacts
+match_engine/target/
+match_engine/pkg-node/
+
+# Generated wasm bindings + fixtures (rebuilt inside the image)
+match_engine/web/pkg/
+match_engine/web/matches/
+match_engine/web/matches.json
