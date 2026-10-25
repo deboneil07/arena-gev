@@ -16,6 +16,7 @@
 //! `#[wasm_bindgen]` [`WasmMatchEngine`] is a thin JS-facing wrapper compiled
 //! only for `wasm32`.
 
+use crate::agent::PlayerRole;
 use crate::engine::{EventRecord, RenderEntity, SimulationEngine};
 use crate::loader::parse_opta_f24;
 
@@ -215,6 +216,99 @@ impl MatchRenderer {
         self.engine.agent_count()
     }
 
+    /// Coarse role of player `index`:
+    /// `0 unknown, 1 goalkeeper, 2 defender, 3 midfielder, 4 forward`.
+    #[inline]
+    pub fn player_role(&self, index: usize) -> u8 {
+        match self.engine.agents.get(index).map(|a| a.role) {
+            Some(PlayerRole::Goalkeeper) => 1,
+            Some(PlayerRole::Defender) => 2,
+            Some(PlayerRole::Midfielder) => 3,
+            Some(PlayerRole::Forward) => 4,
+            _ => 0,
+        }
+    }
+
+    /// Current speed of player `index` in metres per second.
+    #[inline]
+    pub fn player_speed(&self, index: usize) -> f32 {
+        self.engine
+            .agents
+            .get(index)
+            .map(|a| a.speed())
+            .unwrap_or(0.0)
+    }
+
+    /// Velocity of player `index` as `[vx, vy]` m/s.
+    #[inline]
+    pub fn player_velocity(&self, index: usize) -> [f32; 2] {
+        let v = self.engine.player_velocity(index);
+        [v.x, v.y]
+    }
+
+    /// Duty code of player `index` (0 unknown … 8 striker).
+    #[inline]
+    pub fn player_duty(&self, index: usize) -> u8 {
+        self.engine.player_duty(index)
+    }
+
+    /// Intent code of player `index` (0 hold … 6 run).
+    #[inline]
+    pub fn player_intent(&self, index: usize) -> u8 {
+        self.engine.player_intent(index)
+    }
+
+    /// Phase code for a team (0 build-up … 7 defensive transition).
+    #[inline]
+    pub fn team_phase(&self, team: usize) -> u8 {
+        self.engine.team_phase(team)
+    }
+
+    /// Agent index of the team's presser / cover / runner (-1 if none).
+    #[inline]
+    pub fn team_presser(&self, team: usize) -> i32 {
+        self.engine.team_presser(team)
+    }
+
+    /// Agent index of the team's cover (-1 if none).
+    #[inline]
+    pub fn team_cover(&self, team: usize) -> i32 {
+        self.engine.team_cover(team)
+    }
+
+    /// Agent index of the team's runner (-1 if none).
+    #[inline]
+    pub fn team_runner(&self, team: usize) -> i32 {
+        self.engine.team_runner(team)
+    }
+
+    /// Agent index this player is marking (-1 if none).
+    #[inline]
+    pub fn player_mark(&self, index: usize) -> i32 {
+        self.engine.player_mark(index)
+    }
+
+    /// Team currently in possession: `0` home, `1` away, `-1` neutral.
+    ///
+    /// This mirrors the engine's offside-line definition (the team of the
+    /// next scheduled event), so the tactical overlays and the offside line
+    /// always agree.
+    #[inline]
+    pub fn possession_team(&self) -> i32 {
+        match self.engine.possession.as_deref() {
+            Some(id) if id == self.engine.home_team_id.as_str() => 0,
+            Some(id) if id == self.engine.away_team_id.as_str() => 1,
+            _ => -1,
+        }
+    }
+
+    /// Whether a corner/free kick/throw-in/kick-off is currently reshaping
+    /// the teams.
+    #[inline]
+    pub fn set_piece_active(&self) -> bool {
+        self.engine.set_piece_active()
+    }
+
     /// A copy of the full flat buffer.
     #[inline]
     pub fn buffer_vec(&self) -> Vec<f32> {
@@ -262,6 +356,38 @@ impl MatchRenderer {
         self.engine.recent_events.get(index)
     }
 
+    /// Player id credited on feed entry `index` (empty for team rows).
+    #[inline]
+    pub fn recent_event_player(&self, index: usize) -> &str {
+        self.engine
+            .recent_events
+            .get(index)
+            .map(|e| e.player.as_str())
+            .unwrap_or("")
+    }
+
+    /// Agent index for a player id, or -1 when unknown.
+    pub fn player_index_by_id(&self, id: &str) -> i32 {
+        self.engine.agent_index(id).map(|i| i as i32).unwrap_or(-1)
+    }
+
+    /// True when player `index` has been sent off (walks to the bench but is
+    /// still rendered; overlay geometry must ignore him).
+    #[inline]
+    pub fn is_player_dismissed(&self, index: usize) -> bool {
+        self.engine
+            .agents
+            .get(index)
+            .map(|a| a.sent_off)
+            .unwrap_or(false)
+    }
+
+    /// Active set-piece kind (`kickoff|corner|freekick|throwin|penalty|
+    /// goalkick`), or empty during open play.
+    pub fn set_piece_kind(&self) -> &'static str {
+        self.engine.set_piece_kind().unwrap_or("")
+    }
+
     /// Current simulation clock (seconds).
     #[inline]
     pub fn sim_time(&self) -> f32 {
@@ -278,6 +404,29 @@ impl MatchRenderer {
     #[inline]
     pub fn engine(&self) -> &SimulationEngine {
         &self.engine
+    }
+
+    /// Origin (x, y) of the most recently dispatched event snapshot.
+    pub fn last_event_origin(&self) -> (f32, f32) {
+        self.engine
+            .event_snapshots
+            .last()
+            .map(|s| (s.origin.x, s.origin.y))
+            .unwrap_or((0.0, 0.0))
+    }
+
+    /// Type id of the most recently dispatched event snapshot.
+    pub fn last_event_type(&self) -> u16 {
+        self.engine.event_snapshots.last().map(|s| s.type_id).unwrap_or(0)
+    }
+
+    /// Team index (0 home, 1 away) of the most recently dispatched event.
+    pub fn last_event_team(&self) -> u8 {
+        self.engine
+            .event_snapshots
+            .last()
+            .map(|s| if s.doer_id.starts_with("h") { 0 } else { 1 })
+            .unwrap_or(2)
     }
 
     /// Mutable access to the underlying engine (e.g. custom config in tests).
@@ -346,10 +495,36 @@ mod glue {
             self.inner.player_count()
         }
 
-        /// Tournament clock in seconds.
-        pub fn get_sim_time(&self) -> f32 {
-            self.inner.sim_time()
+        /// Coarse role of player `i`:
+        /// `0 unknown, 1 goalkeeper, 2 defender, 3 midfielder, 4 forward`.
+        pub fn get_player_role(&self, i: usize) -> u8 {
+            self.inner.player_role(i)
         }
+
+        /// Current speed of player `i` in metres per second.
+        pub fn get_player_speed(&self, i: usize) -> f32 {
+            self.inner.player_speed(i)
+        }
+
+        /// Team currently in possession: `0` home, `1` away, `-1` neutral.
+        pub fn get_possession_team(&self) -> i32 {
+            self.inner.possession_team()
+        }
+
+        /// True while a set piece is reshaping both teams.
+        pub fn get_set_piece_active(&self) -> bool {
+            self.inner.set_piece_active()
+        }
+
+    /// Tournament clock in seconds.
+    pub fn get_sim_time(&self) -> f32 {
+        self.inner.engine().sim_time
+    }
+
+    /// Current period (1 = first half, 2 = second half, …).
+    pub fn get_current_period(&self) -> u8 {
+        self.inner.engine().current_period()
+    }
 
         /// True once the match has played out.
         pub fn get_is_finished(&self) -> bool {
@@ -400,6 +575,26 @@ mod glue {
             self.inner.event_seq()
         }
 
+        /// Origin x of the most recently dispatched event.
+        pub fn get_last_event_origin_x(&self) -> f32 {
+            self.inner.last_event_origin().0
+        }
+
+        /// Origin y of the most recently dispatched event.
+        pub fn get_last_event_origin_y(&self) -> f32 {
+            self.inner.last_event_origin().1
+        }
+
+        /// Type id of the most recently dispatched event.
+        pub fn get_last_event_type(&self) -> u16 {
+            self.inner.last_event_type()
+        }
+
+        /// Team index (0 home, 1 away) of the most recently dispatched event.
+        pub fn get_last_event_team(&self) -> u8 {
+            self.inner.last_event_team()
+        }
+
         /// Number of entries in the recent-event feed (newest last).
         pub fn get_recent_event_count(&self) -> usize {
             self.inner.recent_event_count()
@@ -428,6 +623,68 @@ mod glue {
         /// Whether feed entry `i` deserves a large splash.
         pub fn get_recent_event_notable(&self, i: usize) -> bool {
             self.inner.recent_event(i).map(|e| e.notable).unwrap_or(false)
+        }
+
+        /// Player id credited on feed entry `i` (empty for team rows).
+        pub fn get_recent_event_player(&self, i: usize) -> String {
+            self.inner.recent_event_player(i).to_string()
+        }
+
+        /// Agent index for a player id, or -1 when unknown.
+        pub fn get_player_index_by_id(&self, id: &str) -> i32 {
+            self.inner.player_index_by_id(id)
+        }
+
+        /// True when player `i` has been sent off (render the walk-off, but
+        /// keep him out of shape geometry).
+        pub fn get_is_player_dismissed(&self, i: usize) -> bool {
+            self.inner.is_player_dismissed(i)
+        }
+
+        /// Active set-piece kind, or empty during open play.
+        pub fn get_set_piece_kind(&self) -> String {
+            self.inner.set_piece_kind().to_string()
+        }
+
+        /// Velocity `[vx, vy]` m/s of player `i`.
+        pub fn get_player_velocity(&self, i: usize) -> Vec<f32> {
+            let v = self.inner.player_velocity(i);
+            vec![v[0], v[1]]
+        }
+
+        /// Duty code of player `i` (0 unknown … 8 striker).
+        pub fn get_player_duty(&self, i: usize) -> u8 {
+            self.inner.player_duty(i)
+        }
+
+        /// Intent code of player `i` (0 hold … 6 run).
+        pub fn get_player_intent(&self, i: usize) -> u8 {
+            self.inner.player_intent(i)
+        }
+
+        /// Phase code for team `t` (0 build-up … 7 defensive transition).
+        pub fn get_team_phase(&self, t: usize) -> u8 {
+            self.inner.team_phase(t)
+        }
+
+        /// Presser / cover / runner agent index for team `t` (-1 if none).
+        pub fn get_team_presser(&self, t: usize) -> i32 {
+            self.inner.team_presser(t)
+        }
+
+        /// Cover agent index for team `t` (-1 if none).
+        pub fn get_team_cover(&self, t: usize) -> i32 {
+            self.inner.team_cover(t)
+        }
+
+        /// Runner agent index for team `t` (-1 if none).
+        pub fn get_team_runner(&self, t: usize) -> i32 {
+            self.inner.team_runner(t)
+        }
+
+        /// Opponent agent index marked by player `i` (-1 if none).
+        pub fn get_player_mark(&self, i: usize) -> i32 {
+            self.inner.player_mark(i)
         }
 
         // ── Match stats ──
@@ -556,6 +813,34 @@ mod wasm_tests {
         // Second write with fewer entities must clear the rest.
         b.write(&[RenderEntity { x: 1.0, y: 0.0, z: 0.0, heading: 0.0, team_index: 0, shirt_number: 1 }]);
         assert_eq!(b.entity(1), Some([0.0; 6]));
+    }
+
+    #[test]
+    fn test_renderer_exposes_tactical_player_metadata() {
+        let mut r = MatchRenderer::from_xml(SAMPLE_XML).unwrap();
+        assert_eq!(r.player_count(), 22);
+        // Home XI categories from the sample: GK, 4 DEF, 3 MID, 3 FWD.
+        assert_eq!(r.player_role(0), 1);
+        assert!((1..=4).all(|i| r.player_role(i) == 2));
+        assert!((5..=7).all(|i| r.player_role(i) == 3));
+        assert!((8..=10).all(|i| r.player_role(i) == 4));
+        // Missing indexes are safe.
+        assert_eq!(r.player_role(999), 0);
+        assert_eq!(r.player_speed(999), 0.0);
+
+        r.run_for(10.0);
+        for i in 0..r.player_count() {
+            let speed = r.player_speed(i);
+            assert!(speed.is_finite() && speed >= 0.0, "bad speed at {i}: {speed}");
+        }
+        // Possession maps the engine's team id to the render buffer's indexes.
+        r.engine_mut().possession = Some("home".into());
+        assert_eq!(r.possession_team(), 0);
+        r.engine_mut().possession = Some("away".into());
+        assert_eq!(r.possession_team(), 1);
+        r.engine_mut().possession = None;
+        assert_eq!(r.possession_team(), -1);
+        let _ = r.set_piece_active();
     }
 
     #[test]

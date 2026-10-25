@@ -198,8 +198,10 @@ fn accuracy_contract_holds_for_the_full_match() {
     println!("slip  max {:.2}s, >2s on {slipped:.1}%", m.max_slip);
 
     // ── Baseline guards (tightened phase by phase) ──
-    // Measured after the readiness gate: doer 98.3, ball 99.7, both 98.7,
-    // ghost 0.6, recv 89.6, nearest 91.9, slip max 2.02s / 1.8% over 2s.
+    // Measured with WS2 (neutral role priors, formation apply, dismissal,
+    // last-touch possession, penalty/goalkick states): doer 98.8/92.9, ball
+    // 99.9/80.8, both 99.2, ghost 0.0, recv 96.7, nearest 91.1, slip max
+    // 2.01s / 1.0% over 2s.
     assert!(doer_15 >= 97.0, "doer ≤1.5m regressed: {doer_15:.1}%");
     assert!(doer_10 >= 77.5, "doer ≤1.0m regressed: {doer_10:.1}%");
     assert!(ball_15 >= 99.0, "ball ≤1.5m regressed: {ball_15:.1}%");

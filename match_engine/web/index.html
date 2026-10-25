@@ -26,6 +26,17 @@
     }
     button:hover, label.file:hover { background: #30363d; }
     button:disabled { opacity: 0.5; cursor: default; }
+    #analysis-team {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #161b22; border: 1px solid #21262d; border-radius: 999px;
+      padding: 2px 10px; color: #c9d1d9; font-size: 12px; white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    #analysis-team::before {
+      content: ""; width: 8px; height: 8px; border-radius: 50%;
+      background: #f2f2f2; border: 1px solid rgba(0, 0, 0, 0.6);
+    }
+    #analysis-team[data-team="1"]::before { background: #2f81f7; }
     input[type="file"] { display: none; }
     input[type="text"] { background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
       border-radius: 6px; padding: 5px 8px; font-size: 13px; }
@@ -37,6 +48,8 @@
     }
     #filelist button:hover { background: #21262d; border-color: #58a6ff; }
     #status { min-height: 1.2em; font-size: 12px; color: #f85149; margin-bottom: 8px; text-align: center; }
+    #momentum { width: 100%; background: #161b22; border: 1px solid #21262d; border-radius: 8px; }
+    #sidebar .hint { font-weight: 400; font-size: 11px; color: #8b949e; }
 
     /* Scoreboard + possession */
     #scoreboard { display: flex; align-items: center; gap: 10px; background: #161b22;
@@ -62,19 +75,31 @@
     }
     /* Centre splash for big moments (inside the pitch). */
     #splash {
-      position: absolute; top: 36%; left: 50%; transform: translate(-50%, -50%) scale(0.9);
-      padding: 14px 30px; border-radius: 10px;
+      position: absolute; top: 14px; right: 14px; left: auto; transform: none;
+      padding: 10px 18px; border-radius: 10px;
       background: rgba(13, 17, 23, 0.9);
       border: 2px solid #2f81f7;
-      color: #e6edf3; font-size: 30px; font-weight: 800; letter-spacing: 1px;
+      color: #e6edf3; font-size: 22px; font-weight: 800; letter-spacing: 1px;
       text-transform: uppercase; text-align: center; white-space: nowrap;
       opacity: 0; pointer-events: none;
-      transition: opacity 220ms ease, transform 220ms ease;
+      transition: opacity 220ms ease;
       text-shadow: 0 2px 12px rgba(0, 0, 0, 0.8);
     }
-    #splash.show { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-    #splash .who { display: block; font-size: 14px; font-weight: 600; letter-spacing: 0.5px;
-      text-transform: none; color: #8b949e; margin-top: 4px; }
+    #splash.show { opacity: 1; }
+    #halftime-banner {
+      position: absolute; top: 12px; left: 50%; transform: translateX(-50%) scale(0.98);
+      padding: 10px 26px; border-radius: 10px;
+      background: rgba(13, 17, 23, 0.92);
+      border: 2px solid #f2f2f2;
+      color: #e6edf3; text-align: center;
+      opacity: 0; pointer-events: none;
+      transition: opacity 300ms ease, transform 300ms ease;
+      z-index: 5;
+    }
+    #halftime-banner.show { opacity: 1; transform: translateX(-50%) scale(1); }
+    #halftime-banner .ht-title { font-size: 18px; font-weight: 800; letter-spacing: 2px; }
+    #halftime-banner .ht-score { font-size: 16px; font-weight: 700; margin: 2px 0; font-variant-numeric: tabular-nums; }
+    #halftime-banner .ht-sub { font-size: 11px; color: #8b949e; }
 
     /* Event panel OUTSIDE the map. */
     #sidebar {
@@ -86,7 +111,7 @@
     }
     #sidebar h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px;
       color: #8b949e; margin: 0 0 10px; font-weight: 600; }
-    #feed { display: flex; flex-direction: column; gap: 4px; overflow: hidden; flex: 1; }
+    #feed { display: flex; flex-direction: column; gap: 4px; overflow-y: auto; max-height: 260px; }
     #feed .row {
       display: flex; gap: 8px; align-items: center;
       background: #161b22; border-left: 3px solid #30363d; border-radius: 0 4px 4px 0;
@@ -131,8 +156,25 @@
     #teams em { color: #8b949e; font-style: normal; margin: 0 4px; }
     #match-info { color: #8b949e; font-size: 12px; }
 
-    .legend { display: flex; gap: 16px; font-size: 12px; color: #8b949e; margin-top: 10px; justify-content: center; }
+    .legend { display: flex; gap: 16px; row-gap: 8px; flex-wrap: wrap; font-size: 12px; color: #8b949e; margin-top: 10px; justify-content: center; align-items: center; }
+    .legend-sep { width: 1px; height: 14px; background: #30363d; }
     .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: middle; border: 1px solid #000; }
+    .line-swatch { display: inline-block; width: 18px; height: 0; margin-right: 6px; vertical-align: middle; border-top: 2px solid #7ee7ff; }
+    .line-swatch.offside { border-top-style: dashed; border-top-color: #ff6464; }
+    .triangle-swatch {
+      display: inline-block; width: 0; height: 0; margin-right: 6px; vertical-align: middle;
+      border-left: 5px solid transparent; border-right: 5px solid transparent;
+      border-bottom: 9px solid rgba(242, 242, 242, 0.65);
+    }
+    .node-swatch {
+      display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px;
+      vertical-align: middle; border: 1.5px solid #f2f2f2; background: rgba(242, 242, 242, 0.35);
+    }
+    .heat-swatch {
+      display: inline-block; width: 22px; height: 10px; margin-right: 6px; vertical-align: middle;
+      border-radius: 2px; border: 1px solid #30363d;
+      background: linear-gradient(90deg, rgba(255, 236, 170, 0.9), rgba(255, 190, 90, 0.9) 48%, rgba(140, 200, 255, 0.9) 52%, rgba(110, 160, 255, 0.9));
+    }
   </style>
 </head>
 <body>
@@ -145,6 +187,7 @@
     <span id="match-info">—</span>
     <span>Match Time <strong id="timer">00:00</strong></span>
     <span>Possession <span id="possbar"><i id="posshome" style="width:50%"></i><i id="possaway" style="width:50%"></i></span><strong id="possval">50%</strong></span>
+    <span id="analysis-team" data-team="0"><span id="analysis-team-label">Home</span></span>
     <span>Sim <strong id="fps">—</strong> FPS</span>
     <span>Ball Alt <strong id="altitude">0.0</strong> m</span>
   </div>
@@ -175,10 +218,21 @@
     <div id="stage">
       <canvas id="gev-canvas" width="1050" height="680"></canvas>
       <div id="splash"></div>
+      <div id="halftime-banner">
+        <div class="ht-title">HALF TIME</div>
+        <div class="ht-score" id="ht-score">0 – 0</div>
+        <div class="ht-sub">Second half kicks off shortly</div>
+      </div>
     </div>
     <aside id="sidebar">
       <h2>Live Events</h2>
       <div id="feed"></div>
+      <h2>Analysis Map <span class="hint" id="minimap-title">—</span></h2>
+      <canvas id="minimap" width="280" height="180"></canvas>
+      <h2>Highlights <span class="hint" id="highlight-title">—</span></h2>
+      <canvas id="highlight" width="280" height="180"></canvas>
+      <h2>Momentum <span class="hint">xT model est.</span></h2>
+      <canvas id="momentum" width="300" height="90"></canvas>
     </aside>
   </div>
 
@@ -186,8 +240,12 @@
     <span><i class="swatch" style="background:#f2f2f2"></i>Home</span>
     <span><i class="swatch" style="background:#2f81f7"></i>Away</span>
     <span><i class="swatch" style="background:#ffea00"></i>Ball</span>
+    <span class="legend-sep"></span>
+    <span><i class="line-swatch" style="border-top-color:#7ee7ff"></i>Analysis</span>
+    <span><i class="line-swatch offside"></i>Offside</span>
+    <span><i class="heat-swatch"></i>Heat · match so far</span>
   </div>
 
-  <script type="module" src="./app.js?v=2"></script>
+  <script type="module" src="./app.js?v=12"></script>
 </body>
 </html>

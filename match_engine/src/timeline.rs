@@ -162,22 +162,7 @@ mod timeline_tests {
     use crate::parser::{AttackDirection, MatchContext, NormalizedEvent};
 
     fn make_event(id: u64, time_secs: f32, type_id: u16) -> NormalizedEvent {
-        NormalizedEvent {
-            id,
-            type_id,
-            period_id: 1,
-            match_time_secs: time_secs,
-            team_id: "t1".into(),
-            player_id: "p1".into(),
-            player_name: "Test".into(),
-            origin_x: 0.0,
-            origin_y: 0.0,
-            target_x: None,
-            target_y: None,
-            outcome: true,
-            is_aerial: false,
-            is_own_goal: false,
-        }
+        NormalizedEvent::test(id, type_id, time_secs, "t1", "p1", 0.0, 0.0)
     }
 
     #[test]

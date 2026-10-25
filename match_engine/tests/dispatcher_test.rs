@@ -5,7 +5,7 @@
 //! physical limits.
 
 use match_engine::agent::{AgentState, PlayerAgent};
-use match_engine::dispatcher::{travel_time, LookaheadDispatcher};
+use match_engine::dispatcher::{travel_time, LookaheadDispatcher, SLIP_MAX_SECS};
 use match_engine::formation::Vector2;
 use match_engine::parser::NormalizedEvent;
 
@@ -18,22 +18,10 @@ fn mk_event(
     y: f32,
     target: Option<(f32, f32)>,
 ) -> NormalizedEvent {
-    NormalizedEvent {
-        id,
-        type_id: 1,
-        period_id: 1,
-        match_time_secs: time,
-        team_id: team.into(),
-        player_id: player.into(),
-        player_name: player.into(),
-        origin_x: x,
-        origin_y: y,
-        target_x: target.map(|t| t.0),
-        target_y: target.map(|t| t.1),
-        outcome: true,
-        is_aerial: false,
-        is_own_goal: false,
-    }
+    let mut ev = NormalizedEvent::test(id, 1, time, team, player, x, y);
+    ev.target_x = target.map(|t| t.0);
+    ev.target_y = target.map(|t| t.1);
+    ev
 }
 
 fn mk_agent(id: &str, team: &str, x: f32, y: f32) -> PlayerAgent {
@@ -57,22 +45,10 @@ fn test_lookahead_anticipation_and_execution() {
     )];
 
     // Event occurs at t = 3.0s at midfield (-10.0, 0.0). Distance = 20m.
-    let event = NormalizedEvent {
-        id: 101,
-        type_id: 1, // Pass
-        period_id: 1,
-        match_time_secs: 3.0,
-        team_id: team_id.clone(),
-        player_id: player_id.clone(),
-        player_name: "Van de Ven".to_string(),
-        origin_x: -10.0,
-        origin_y: 0.0,
-        target_x: Some(15.0),
-        target_y: Some(5.0),
-        outcome: true,
-        is_aerial: false,
-        is_own_goal: false,
-    };
+    let mut event = NormalizedEvent::test(101, 1, 3.0, &team_id, &player_id, -10.0, 0.0);
+    event.player_name = "Van de Ven".to_string();
+    event.target_x = Some(15.0);
+    event.target_y = Some(5.0);
 
     let mut dispatcher = LookaheadDispatcher::new(vec![event], 3.5);
     let dt = 1.0 / 60.0;
@@ -82,7 +58,7 @@ fn test_lookahead_anticipation_and_execution() {
 
     // Simulate for 3.5 seconds (210 ticks)
     for _ in 0..210 {
-        let actions = dispatcher.tick(dt, &mut agents, None);
+        let actions = dispatcher.tick(dt, &mut agents, None, SLIP_MAX_SECS);
 
         if let AgentState::AnticipatingEvent { target } = agents[0].state {
             anticipation_triggered = true;
@@ -127,7 +103,7 @@ fn test_farther_events_are_anticipated_earlier() {
         );
         let mut agents = vec![mk_agent("p", "t", 0.0, 0.0)];
         for tick in 0..600 {
-            d.tick(dt, &mut agents, None);
+            d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
             if matches!(agents[0].state, AgentState::AnticipatingEvent { .. }) {
                 return tick as f32 * dt;
             }
@@ -155,7 +131,7 @@ fn test_execution_only_after_event_time() {
     let dt = 1.0 / 60.0;
     let mut executed_at = None;
     for tick in 1..=180 {
-        let actions = d.tick(dt, &mut agents, None);
+        let actions = d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
         if !actions.is_empty() {
             executed_at = Some(tick as f32 * dt);
         }
@@ -179,7 +155,7 @@ fn test_receiver_chained_lookahead() {
     let mut agents = vec![mk_agent("p1", "t", -5.0, 0.0), mk_agent("p2", "t", 0.0, 30.0)];
     let dt = 1.0 / 60.0;
     for _ in 0..45 {
-        d.tick(dt, &mut agents, None);
+        d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
         for a in agents.iter_mut() {
             a.update_kinematics(dt, Vector2::zero(), &[], Vector2::zero());
         }
@@ -207,7 +183,7 @@ fn test_no_teleportation_through_dispatch() {
     let dt = 1.0 / 60.0;
     let mut prev = agents[0].position;
     for _ in 0..300 {
-        d.tick(dt, &mut agents, None);
+        d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
         agents[0].update_kinematics(dt, Vector2::zero(), &[], Vector2::zero());
         let step = prev.distance(agents[0].position);
         assert!(step <= 8.5 * dt + 1e-3, "teleport: {step} m in one tick");
@@ -224,7 +200,7 @@ fn test_acceleration_cap_respected() {
     let mut agents = vec![mk_agent("p", "t", -40.0, -30.0)];
     let dt = 1.0 / 60.0;
     for _ in 0..300 {
-        d.tick(dt, &mut agents, None);
+        d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
         agents[0].update_kinematics(dt, Vector2::zero(), &[], Vector2::zero());
         assert!(agents[0].acceleration.length() <= agents[0].max_accel + 1e-3);
     }
@@ -245,8 +221,8 @@ fn test_dispatch_is_deterministic() {
     let mut bb = aa.clone();
     let dt = 1.0 / 60.0;
     for _ in 0..300 {
-        a.tick(dt, &mut aa, None);
-        b.tick(dt, &mut bb, None);
+        a.tick(dt, &mut aa, None, SLIP_MAX_SECS);
+        b.tick(dt, &mut bb, None, SLIP_MAX_SECS);
         for x in aa.iter_mut() {
             x.update_kinematics(dt, Vector2::zero(), &[], Vector2::zero());
         }
@@ -274,7 +250,7 @@ fn test_finishes_after_all_events() {
     // The readiness gate holds an event until its doer is on the origin, so
     // the actor has to actually be allowed to move for the feed to finish.
     for _ in 0..150 {
-        d.tick(1.0 / 60.0, &mut agents, None);
+        d.tick(1.0 / 60.0, &mut agents, None, SLIP_MAX_SECS);
         agents[0].update_kinematics(1.0 / 60.0, Vector2::zero(), &[], Vector2::zero());
     }
     assert!(d.is_finished());

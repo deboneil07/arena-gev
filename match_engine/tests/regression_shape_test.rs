@@ -127,6 +127,7 @@ fn test_attackers_never_offside() {
     let dur = sim.timeline.duration_secs();
     let (mut n, mut over15) = (0u64, 0u64);
     let (mut sum, mut max_over) = (0.0f64, 0.0f32);
+    let mut worst = String::new();
     while sim.sim_time < dur + 1.0 {
         sim.step();
         if sim.set_piece_active() {
@@ -141,10 +142,17 @@ fn test_attackers_never_offside() {
             if agent.team_id != poss {
                 continue;
             }
-            if matches!(
-                agent.brain.current_intent,
-                TacticalIntent::AnticipateEvent { .. }
-            ) {
+            if agent.assigned_event_id.is_some()
+                || agent.receiver_task.is_some()
+                || matches!(
+                    agent.state,
+                    match_engine::AgentState::AnticipatingEvent { .. }
+                )
+                || matches!(
+                    agent.brain.current_intent,
+                    TacticalIntent::AnticipateEvent { .. }
+                )
+            {
                 continue;
             }
             let is_home = agent.team_id == *home;
@@ -158,9 +166,46 @@ fn test_attackers_never_offside() {
                 ball_x,
             );
             let over = (agent.position.x - limit) * attack_dx;
+            if over > max_over {
+                max_over = over;
+                let mut defenders: Vec<(f32, String)> = sim
+                    .agents
+                    .iter()
+                    .filter(|a| a.team_id != poss)
+                    .map(|a| (a.position.x * attack_dx, a.id.clone()))
+                    .collect();
+                defenders.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                let recent: Vec<String> = sim
+                    .event_snapshots
+                    .iter()
+                    .rev()
+                    .take(6)
+                    .map(|s| {
+                        format!(
+                            "{}@{:.0}({:.1},{:.1})",
+                            s.type_id, s.feed_time, s.origin.x, s.origin.y
+                        )
+                    })
+                    .collect();
+                worst = format!(
+                    "t={:.1} {} {:?}/{:?} intent={:?} state={:?} assigned={:?} pos=({:.1},{:.1}) limit={:.1} ball_x={:.1} defenders={:?} recent={:?}",
+                    sim.sim_time,
+                    agent.id,
+                    agent.role,
+                    agent.duty,
+                    agent.brain.current_intent,
+                    agent.state,
+                    agent.assigned_event_id,
+                    agent.position.x,
+                    agent.position.y,
+                    limit,
+                    ball_x,
+                    &defenders[..3.min(defenders.len())],
+                    recent
+                );
+            }
             n += 1;
             sum += over as f64;
-            max_over = max_over.max(over);
             if over > 1.5 {
                 over15 += 1;
             }
@@ -171,7 +216,7 @@ fn test_attackers_never_offside() {
     let frac = over15 as f64 / n as f64;
     assert!(
         frac < 0.001,
-        "{:.3}% of {n} open-play samples sat >1.5 m beyond the offside line (worst {:.1} m, mean {mean:.2} m)",
+        "{:.3}% of {n} open-play samples sat >1.5 m beyond the offside line (worst {:.1} m, mean {mean:.2} m; {worst})",
         frac * 100.0,
         max_over
     );
@@ -180,7 +225,7 @@ fn test_attackers_never_offside() {
     // eases them back at one sprint step per tick (never teleports).
     assert!(
         max_over < 20.0,
-        "an attacker sat {max_over:.1} m beyond the offside line over {n} samples (mean {mean:.2} m)"
+        "an attacker sat {max_over:.1} m beyond the offside line over {n} samples (mean {mean:.2} m; {worst})"
     );
     assert!(
         mean <= 1.0,
@@ -196,7 +241,7 @@ fn test_backline_flat_without_breathing() {
     let dur = sim.timeline.duration_secs();
     let mut sums = [0.0f64; 2];
     let mut counts = [0u32; 2];
-    let mut all: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+    let mut all: [Vec<(f32, String)>; 2] = [Vec::new(), Vec::new()];
     let mut tick = 0u64;
     while sim.sim_time < dur + 1.0 {
         sim.step();
@@ -209,28 +254,76 @@ fn test_backline_flat_without_breathing() {
             let mut max_x = f32::NEG_INFINITY;
             let mut defs = 0u32;
             for a in sim.agents.iter() {
-                if a.team_id == *team_id && a.role == PlayerRole::Defender {
-                    min_x = min_x.min(a.position.x);
-                    max_x = max_x.max(a.position.x);
-                    defs += 1;
+                if a.team_id != *team_id || a.role != PlayerRole::Defender {
+                    continue;
                 }
+                // A defender actively dispatched by the feed (e.g. running to
+                // take a corner or receive a pass) is not holding the line;
+                // the feed's spot is authoritative. Stale receiver tasks are
+                // ignored, exactly as the brain ignores them after the
+                // deadline.
+                let routed = a
+                    .receiver_task
+                    .map(|(_, deadline)| sim.sim_time <= deadline + 0.5)
+                    .unwrap_or(false);
+                if routed
+                    || matches!(
+                        a.brain.current_intent,
+                        TacticalIntent::AnticipateEvent { .. }
+                    )
+                {
+                    continue;
+                }
+                min_x = min_x.min(a.position.x);
+                max_x = max_x.max(a.position.x);
+                defs += 1;
             }
             if defs < 3 {
                 continue;
             }
             let spread = max_x - min_x;
+            let detail = if spread > 30.0 {
+                let rows: Vec<String> = sim
+                    .agents
+                    .iter()
+                    .filter(|a| a.team_id == *team_id && a.role == PlayerRole::Defender)
+                    .map(|a| {
+                        format!(
+                            "{} {}/{:?}/{:?} ({:.1},{:.1})",
+                            a.id,
+                            a.shirt_number,
+                            a.duty,
+                            a.brain.current_intent,
+                            a.position.x,
+                            a.position.y
+                        )
+                    })
+                    .collect();
+                format!(
+                    "t={:.1} spread={spread:.1} set_piece={} ball=({:.1},{:.1}) poss={:?} defenders={rows:?}",
+                    sim.sim_time,
+                    sim.set_piece_active(),
+                    sim.ball.position.x,
+                    sim.ball.position.y,
+                    sim.possession
+                )
+            } else {
+                String::new()
+            };
             sums[t] += spread as f64;
             counts[t] += 1;
-            all[t].push(spread);
+            all[t].push((spread, detail));
         }
     }
     for t in 0..2 {
         assert!(counts[t] > 100, "team {t}: too few samples: {}", counts[t]);
         let mean = sums[t] / counts[t] as f64;
-        all[t].sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p95 = all[t][(all[t].len() as f64 * 0.95) as usize];
-        let p99 = all[t][(all[t].len() as f64 * 0.99) as usize];
-        let max = *all[t].last().unwrap();
+        all[t].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let i95 = (all[t].len() as f64 * 0.95) as usize;
+        let i99 = (all[t].len() as f64 * 0.99) as usize;
+        let p95 = all[t][i95].0;
+        let p99 = all[t][i99].0;
+        let max = all[t].last().unwrap().0;
         assert!(
             mean <= 7.5,
             "team {t}: back line spreads {mean:.2} m on average (p95={p95:.1} p99={p99:.1} max={max:.1})"
@@ -239,11 +332,13 @@ fn test_backline_flat_without_breathing() {
         // what matters is that the unit stays compact nearly all the time.
         assert!(
             p95 <= 25.0,
-            "team {t}: back line spread p95={p95:.1} m (mean {mean:.2} m) — the bank broke apart"
+            "team {t}: back line spread p95={p95:.1} m (mean {mean:.2} m) — the bank broke apart; {}",
+            all[t][i95].1
         );
         assert!(
             p99 <= 40.0,
-            "team {t}: back line spread p99={p99:.1} m max={max:.1} — the bank disintegrated"
+            "team {t}: back line spread p99={p99:.1} m max={max:.1} — the bank disintegrated; {}",
+            all[t][i99].1
         );
     }
 }

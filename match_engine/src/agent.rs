@@ -22,6 +22,7 @@
 
 use crate::brain::{TacticalBrain, RAY_COUNT};
 use crate::formation::{TacticalAnchor, Vector2};
+use crate::tactics::Duty;
 use std::collections::HashMap;
 
 // ── Defaults / constants ───────────────────────────────────────
@@ -53,9 +54,13 @@ pub const BRAKE_RADIUS: f32 = 0.05;
 
 // ── State machine ──────────────────────────────────────────────
 
-/// Per-player personality attributes in `0..1`. Derived deterministically from
-/// the player id, so an individual always reacts the same way across runs
-/// while different players behave differently (individualism / flair).
+/// Per-player personality attributes in `0..1`. Neutral role priors with a
+/// small deterministic per-id spread: individuals differ (so a team does not
+/// move like clones) but no attribute carries semantic meaning — nothing in
+/// the engine may let a hash decide a shot, a press, or a placement. Feed
+/// truth (graph, goal-mouth, keeper) decides those; attributes only shade
+/// locomotion variety. Real season stats can replace the priors later via
+/// [`PlayerAttributes::role_prior`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlayerAttributes {
     /// Top-speed multiplier.
@@ -85,48 +90,54 @@ pub struct PlayerAttributes {
 
 impl Default for PlayerAttributes {
     fn default() -> Self {
-        Self {
-            pace: 0.5,
-            aggression: 0.5,
-            workrate: 0.5,
-            flair: 0.5,
-            positioning: 0.5,
-            determination: 0.5,
-            composure: 0.5,
-            stamina: 0.5,
-            anticipation: 0.5,
-            teamwork: 0.5,
-            vision: 0.5,
-        }
+        Self::role_prior(PlayerRole::Unknown, "default")
     }
 }
 
 impl PlayerAttributes {
-    /// Deterministic FNV-1a hash of the id → four independent `0..1` values.
-    pub fn from_id(id: &str) -> Self {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in id.bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        let mut h2: u64 = h ^ 0x9e37_79b9_7f4a_7c15;
-        h2 ^= h2 >> 29;
-        h2 = h2.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        let v = |shift: u32| ((h >> shift) & 0xFF) as f32 / 255.0;
-        let v2 = |shift: u32| ((h2 >> shift) & 0xFF) as f32 / 255.0;
+    /// Neutral prior for a role: each line moves differently (forwards
+    /// sharper, holders more disciplined, keepers reactive), plus a tiny
+    /// deterministic per-id spread (±0.05) for individual variety.
+    pub fn role_prior(role: PlayerRole, id: &str) -> Self {
+        let (pace, aggression, workrate, flair, positioning, determination, composure) =
+            match role {
+                PlayerRole::Goalkeeper => (0.30, 0.25, 0.30, 0.20, 0.85, 0.60, 0.80),
+                PlayerRole::Defender => (0.55, 0.55, 0.50, 0.35, 0.80, 0.65, 0.65),
+                PlayerRole::Midfielder => (0.62, 0.55, 0.70, 0.55, 0.60, 0.65, 0.60),
+                PlayerRole::Forward => (0.78, 0.60, 0.65, 0.65, 0.45, 0.70, 0.55),
+                PlayerRole::Unknown => (0.55, 0.50, 0.55, 0.50, 0.55, 0.60, 0.55),
+            };
+        // Deterministic spread only — no semantic meaning per player.
+        let j = |salt: u64| {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ salt;
+            for b in id.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            ((h >> 11) % 101) as f32 / 100.0 - 0.50
+        };
+        let spread = 0.10;
+        let cl = |v: f32| v.clamp(0.05, 0.95);
         Self {
-            pace: v(0),
-            aggression: v(8),
-            workrate: v(16),
-            flair: v(24),
-            positioning: v(32),
-            determination: v(40),
-            composure: v(48),
-            stamina: v(56),
-            anticipation: v2(0),
-            teamwork: v2(8),
-            vision: v2(16),
+            pace: cl(pace + j(1) * spread),
+            aggression: cl(aggression + j(2) * spread),
+            workrate: cl(workrate + j(3) * spread),
+            flair: cl(flair + j(4) * spread),
+            positioning: cl(positioning + j(5) * spread),
+            determination: cl(determination + j(6) * spread),
+            composure: cl(composure + j(7) * spread),
+            stamina: cl(0.60 + j(8) * spread),
+            anticipation: cl(0.55 + j(9) * spread),
+            teamwork: cl(0.60 + j(10) * spread),
+            vision: cl(0.55 + j(11) * spread),
         }
+    }
+
+    /// Deterministic attributes for an id (legacy entry point): neutral
+    /// midfield-ish prior with per-id spread. Prefer [`Self::role_prior`]
+    /// with the player's actual role wherever it is known.
+    pub fn from_id(id: &str) -> Self {
+        Self::role_prior(PlayerRole::Unknown, id)
     }
 }
 
@@ -199,6 +210,9 @@ pub struct PlayerAgent {
     pub is_goalkeeper: bool,
     /// Coarse playing role (set from the Opta position category).
     pub role: PlayerRole,
+    /// Specific positional job (CB/FB/DM/CM/AM/W/ST), derived from the
+    /// lineup and preserved across substitutions.
+    pub duty: Duty,
     /// Individual personality attributes.
     pub attributes: PlayerAttributes,
     /// Temporary sprint multiplier used when a player is running late to an
@@ -212,6 +226,10 @@ pub struct PlayerAgent {
     context_timer: f32,
     /// Event this player is currently scheduled to execute (if any).
     pub assigned_event_id: Option<u64>,
+    /// Sent off (red card): walks to the touchline and stays out of the
+    /// team's plans. The body remains rendered (the walk-off reads on
+    /// screen) but the side plays short-handed.
+    pub sent_off: bool,
     /// Receiver routing: `(landing target, absolute sim time by which to
     /// arrive)`. Set by the dispatcher so an intended pass receiver is on the
     /// landing spot when the ball gets there.
@@ -258,17 +276,31 @@ impl PlayerAgent {
             } else {
                 PlayerRole::Unknown
             },
+            duty: if is_goalkeeper {
+                Duty::Goalkeeper
+            } else {
+                Duty::Unknown
+            },
             attributes,
             sprint_boost: 1.0,
             brain: TacticalBrain::new(),
             context_dir: Vector2::zero(),
             context_timer: 0.0,
             assigned_event_id: None,
+            sent_off: false,
             receiver_task: None,
             prev_position: start_pos,
             state: AgentState::InFormation,
             facing_ball: false,
         }
+    }
+
+    /// Re-derive neutral attributes from the current role (e.g. after the
+    /// role is assigned from the lineup, or a substitute inherits a slot).
+    /// Keeps sprint caps consistent with the new pace.
+    pub fn refresh_attributes(&mut self) {
+        self.attributes = PlayerAttributes::role_prior(self.role, &self.id);
+        self.max_speed_sprint = (7.9 + self.attributes.pace * 0.6).min(MAX_SPEED);
     }
 
     /// Current speed (m/s).

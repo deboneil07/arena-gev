@@ -36,6 +36,7 @@
 pub mod parser;
 pub mod loader;
 pub mod timeline;
+pub mod event_graph;
 pub mod formation;
 pub mod tactics;
 pub mod agent;
@@ -51,13 +52,20 @@ pub mod wasm;
 pub use loader::parse_opta_f24;
 pub use parser::{
     event_type_name, is_ball_event, is_dead_ball_event, is_gameplay_event, is_notable_event,
-    AttackDirection, LineupPlayer, MatchContext, NormalizedEvent, EVENT_TYPE_AERIAL,
-    EVENT_TYPE_CORNER, EVENT_TYPE_FOUL, EVENT_TYPE_GOAL, EVENT_TYPE_OUT, EVENT_TYPE_PASS,
-    PERIOD_PREMATCH, PITCH_HALF_LENGTH, PITCH_HALF_WIDTH, PITCH_LENGTH, PITCH_WIDTH,
+    AttackDirection, BodyPart, CardKind, DuelPolarity, FormationChange, KeeperAction, LineupPlayer,
+    MatchContext, NormalizedEvent, OutcomeReason, PassKind, PitchZone, SetPieceTag, ShotZone,
+    SubReason, EVENT_TYPE_AERIAL, EVENT_TYPE_ATTEMPT_SAVED, EVENT_TYPE_BLOCKED_PASS,
+    EVENT_TYPE_CARD, EVENT_TYPE_CARRY, EVENT_TYPE_CHALLENGE, EVENT_TYPE_CLEARANCE,
+    EVENT_TYPE_CORNER, EVENT_TYPE_FOUL, EVENT_TYPE_GOAL, EVENT_TYPE_INTERCEPTION, EVENT_TYPE_MISS,
+    EVENT_TYPE_OFFSIDE_PASS, EVENT_TYPE_OUT, EVENT_TYPE_PASS, EVENT_TYPE_PLAYER_OFF,
+    EVENT_TYPE_PLAYER_ON, EVENT_TYPE_POST, EVENT_TYPE_SAVE, EVENT_TYPE_TACKLE,
+    EVENT_TYPE_VAR_DELETED, PERIOD_PREMATCH, PITCH_HALF_LENGTH, PITCH_HALF_WIDTH, PITCH_LENGTH,
+    PITCH_WIDTH,
 };
 pub use timeline::Timeline;
+pub use event_graph::{is_completed_pass, is_completed_pass_like, project_on_lane, resolve_pass, PassResolution, ShotResolution};
 pub use formation::{FormationEngine, TacticalAnchor, TeamTacticalPhase, Vector2};
-pub use tactics::{Line, TeamContext, TeamPlan, TeamStyle};
+pub use tactics::{Duty, Line, TeamContext, TeamPhase, TeamPlan, TeamStyle};
 pub use agent::{
     braking_speed, init_agents, simulate_step, AgentState, PlayerAgent, PlayerAttributes,
     PlayerRole, DEFAULT_JOG_SPEED, DEFAULT_MAX_ACCEL, DEFAULT_SPRINT_SPEED, DT, MAX_SPEED,

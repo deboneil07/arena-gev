@@ -20,10 +20,11 @@ use crate::agent::{AgentState, PlayerAgent, PlayerAttributes, PlayerRole, DT, MA
 use crate::ball::{Ball, BallState};
 use crate::dispatcher::{arrival_time, DispatchedAction, LookaheadDispatcher};
 use crate::formation::{FormationEngine, TeamTacticalPhase, Vector2};
-use crate::tactics::TeamStyle;
+use crate::tactics::{Duty, TeamPhase, TeamPlan, TeamStyle};
 use crate::parser::{
-    event_type_name, is_ball_event, is_dead_ball_event, is_notable_event, AttackDirection,
-    LineupPlayer, MatchContext, NormalizedEvent, EVENT_TYPE_CORNER, EVENT_TYPE_FOUL,
+    event_type_name, is_ball_event, is_dead_ball_event, is_notable_event, AttackDirection, BodyPart,
+    CardKind, FormationChange, KeeperAction, LineupPlayer, MatchContext, NormalizedEvent,
+    OutcomeReason, PassKind, SetPieceTag, EVENT_TYPE_CARD, EVENT_TYPE_CORNER, EVENT_TYPE_FOUL,
     EVENT_TYPE_GOAL, EVENT_TYPE_PLAYER_OFF, EVENT_TYPE_PLAYER_ON, PITCH_HALF_LENGTH,
 };
 use crate::timeline::Timeline;
@@ -67,6 +68,11 @@ pub const TEAM_HOME: u8 = 0;
 pub const TEAM_AWAY: u8 = 1;
 pub const TEAM_BALL: u8 = 2;
 
+/// How long a kick-off set piece holds its cage before the teams relax to
+/// their blocks (the kick still fires on schedule via the taker + pickup
+/// rule). Covers celebration gaps and half-time without freezing the shape.
+pub const KICKOFF_HOLD_SECS: f32 = 20.0;
+
 /// Simulation configuration.
 #[derive(Debug, Clone)]
 pub struct SimulationConfig {
@@ -106,6 +112,7 @@ pub struct RenderEntity {
 /// One entry in the on-screen event feed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventRecord {
+    /// Display clock (raw min*60+sec) — what the mm:ss UI row shows.
     pub time: f32,
     pub type_id: u16,
     pub label: &'static str,
@@ -126,8 +133,10 @@ pub const EVENT_FEED_CAPACITY: usize = 12;
 #[derive(Debug, Clone)]
 pub struct EventSnapshot {
     pub event_id: u64,
-    /// Opta timestamp of the event (what the UI row displays).
+    /// Opta timestamp of the event on the sim clock (drives slip math).
     pub feed_time: f32,
+    /// Display clock for mm:ss rows and graphs.
+    pub display_time: f32,
     /// Simulation clock at dispatch (can trail `feed_time` when the event had
     /// to wait for an actor to arrive).
     pub sim_time: f32,
@@ -183,6 +192,10 @@ enum SetPieceKind {
     FreeKick,
     /// Throw-in: the taker walks to the ball, everyone else holds shape.
     ThrowIn,
+    /// Penalty: taker on the spot, keeper on the line, arc rest.
+    Penalty,
+    /// Goal kick: keeper distribution, short or long.
+    GoalKick,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +207,9 @@ struct SetPiece {
     spot: Vector2,
     /// Which side the corner is taken from (+1 / −1), for corners.
     side: f32,
+    /// The feed player who will actually take the restart. Chosen once when
+    /// the restart is armed so the ball anchor never hops between players.
+    taker_id: Option<String>,
 }
 
 /// Explicit, rate-limited position of the three lines in a team's block.
@@ -316,6 +332,30 @@ fn approach_scalar(current: f32, desired: f32, rate: f32, dt: f32) -> f32 {
     current + step * d.signum()
 }
 
+/// Hysteretic phase state for one team. Thresholds alone chatter when the
+/// ball hovers around a line, so a candidate must survive a short dwell
+/// before it becomes the active phase.
+#[derive(Debug, Clone, Copy)]
+struct PhaseTracker {
+    phase: TeamPhase,
+    candidate: TeamPhase,
+    candidate_since: f32,
+    last_in_possession: bool,
+    changed_at: f32,
+}
+
+impl PhaseTracker {
+    const fn new() -> Self {
+        Self {
+            phase: TeamPhase::MidBlock,
+            candidate: TeamPhase::MidBlock,
+            candidate_since: 0.0,
+            last_in_possession: false,
+            changed_at: 0.0,
+        }
+    }
+}
+
 /// The master simulation engine.
 pub struct SimulationEngine {
     pub home_team_id: String,
@@ -338,8 +378,14 @@ pub struct SimulationEngine {
 
     /// The 3D ball.
     pub ball: Ball,
-    /// Team currently in possession (by upcoming event).
+    /// Team currently in possession: the last ball winner. Updated on every
+    /// dispatched ball action (actor's team), except failed passes (in
+    /// dispute) and fouls (restart decides). Falls back to the next event.
     pub possession: Option<String>,
+    /// Winner of the last resolved ball action (drives [`Self::possession`]).
+    last_touch: Option<String>,
+    /// Player id of the last resolved ball action (for awarded-team correction).
+    last_touch_player: Option<String>,
 
     /// Chronological event index (duration/stats queries).
     pub timeline: Timeline,
@@ -361,8 +407,18 @@ pub struct SimulationEngine {
     pending_kickoff: Option<(String, f32)>,
     /// Explicit rate-limited line positions per team: `[home, away]`.
     blocks: [LineBlock; 2],
+    /// Hysteretic game phase per team: `[home, away]`.
+    phases: [PhaseTracker; 2],
+    /// Last per-team tactical plans (presser/cover/support/runner/marks),
+    /// refreshed every tick — the overlay reads the engine's own scheme
+    /// instead of re-deriving it.
+    last_plans: [Option<TeamPlan>; 2],
     /// Base lateral lane per player id (world frame).
     lane_y: HashMap<String, f32>,
+    /// Depth offset from the midfield bank, in the team's attacking frame.
+    /// A 4-2-3-1 keeps its two banks instead of collapsing every midfielder
+    /// onto the single `LineBlock::mid_x`.
+    mid_depth: HashMap<String, f32>,
     /// Period currently being simulated (detects half-time).
     current_period: u8,
     /// Event id → (origin, match time) for the Utility-AI lookahead.
@@ -375,6 +431,10 @@ pub struct SimulationEngine {
     agent_index: HashMap<String, usize>,
     /// Team → player going off, waiting for their replacement event.
     pending_subs: HashMap<String, String>,
+    /// Mid-match formation changes (type 40), chronological.
+    formation_changes: Vec<FormationChange>,
+    /// Index of the next unapplied formation change.
+    formation_cursor: usize,
 
     /// Current simulation clock (seconds).
     pub sim_time: f32,
@@ -390,6 +450,9 @@ pub struct SimulationEngine {
     pub landing_snapshots: Vec<LandingSnapshot>,
     /// A flight in progress that must produce a landing snapshot on touchdown.
     pending_landing: Option<(Vector2, Option<String>)>,
+    /// A held claim in progress: when the current flight lands, attach the
+    /// ball to this keeper instead of letting it roll (collected saves).
+    pending_catch: Option<String>,
 
     // Reusable per-tick buffers.
     anchor_buffer: HashMap<String, Vector2>,
@@ -400,6 +463,84 @@ pub struct SimulationEngine {
 #[inline]
 pub fn ball_spot_expected(type_id: u16) -> bool {
     is_dead_ball_event(type_id) || type_id == EVENT_TYPE_FOUL || is_ball_event(type_id)
+}
+
+/// +1/-1 attack direction of the team that took the shot in `action`
+/// (flipped for own goals, which fly into the scorer's own net).
+fn attack_goal_sign(action: &DispatchedAction, sim: &SimulationEngine) -> f32 {
+    let dx = if action.team_id == sim.home_team_id {
+        1.0
+    } else {
+        -1.0
+    };
+    if action.is_own_goal {
+        -dx
+    } else {
+        dx
+    }
+}
+
+/// Ceremonial kick-off tap: the feed's target is where the next touch
+/// happens, not the pass destination — cap the tap at 2.5 m toward it.
+fn tap_target(origin: Vector2, target: Vector2) -> Vector2 {
+    let lane = target - origin;
+    if lane.length() > 2.5 {
+        origin + lane.normalize() * 2.5
+    } else {
+        target
+    }
+}
+
+/// Stop-to-stop ETA of the pass endpoint's owner: the linked receiver for a
+/// completed pass, the nearest opponent to the endpoint for an interception.
+/// `None` when nobody owns it (loose completion, out ball).
+fn owner_eta(
+    agents: &[PlayerAgent],
+    action: &DispatchedAction,
+    target: Vector2,
+    failed: bool,
+) -> Option<f32> {
+    let eta = |pos: Vector2, sprint: f32, accel: f32| {
+        crate::dispatcher::arrival_time(pos.distance(target), sprint, accel)
+    };
+    if !failed {
+        let rid = action.receiver_id.as_deref()?;
+        let a = agents.iter().find(|a| a.id == rid)?;
+        return Some(eta(a.position, a.max_speed_sprint, a.max_accel));
+    }
+    agents
+        .iter()
+        .filter(|a| !a.sent_off && a.team_id != action.team_id && !a.is_goalkeeper)
+        .map(|a| eta(a.position, a.max_speed_sprint, a.max_accel))
+        .fold(None, |best: Option<f32>, t| {
+            Some(best.map(|b| b.min(t)).unwrap_or(t))
+        })
+}
+
+/// Lateral bend (metres) for a curved delivery: in-swingers bend one way,
+/// out-swingers the other; footedness decides for open-play crosses, corners,
+/// free kicks and through-balls. Straight for everything else.
+fn curve_bend(action: &DispatchedAction) -> f32 {
+    match action.setpiece_swing {
+        SetPieceTag::Inswinger => return 2.5,
+        SetPieceTag::Outswinger => return -2.5,
+        _ => {}
+    }
+    match action.pass_kind {
+        PassKind::Cross | PassKind::CornerTaken | PassKind::FreeKickTaken => {
+            match action.body_part {
+                BodyPart::Left => 1.6,
+                BodyPart::Right => -1.6,
+                _ => 0.0,
+            }
+        }
+        PassKind::ThroughBall => match action.body_part {
+            BodyPart::Left => 1.0,
+            BodyPart::Right => -1.0,
+            _ => 0.0,
+        },
+        _ => 0.0,
+    }
 }
 
 impl SimulationEngine {
@@ -457,6 +598,8 @@ impl SimulationEngine {
             .unwrap_or_else(|| formation.template_vec(&config.away_formation));
         let home_centroid = FormationEngine::template_centroid(&home_template);
         let away_centroid = FormationEngine::template_centroid(&away_template);
+        let home_duties = Duty::from_lineup(&home_xi, &home_template);
+        let away_duties = Duty::from_lineup(&away_xi, &away_template);
 
         let home_anchors = formation.calculate_team_anchors_from_template(
             &home_template,
@@ -476,9 +619,9 @@ impl SimulationEngine {
         );
 
         let mut agents = Vec::with_capacity(home_anchors.len() + away_anchors.len());
-        for (team_id, xi, anchors) in [
-            (&ctx.home_team_id, &home_xi, &home_anchors),
-            (&ctx.away_team_id, &away_xi, &away_anchors),
+        for (team_id, xi, anchors, duties) in [
+            (&ctx.home_team_id, &home_xi, &home_anchors, &home_duties),
+            (&ctx.away_team_id, &away_xi, &away_anchors, &away_duties),
         ] {
             let by_id: HashMap<&str, Vector2> =
                 anchors.iter().map(|a| (a.player_id.as_str(), a.target_pos)).collect();
@@ -492,6 +635,11 @@ impl SimulationEngine {
                     p.position_category == 1,
                 );
                 agent.role = PlayerRole::from_category(p.position_category);
+                agent.duty = duties
+                    .get(&p.player_id)
+                    .copied()
+                    .unwrap_or_else(|| Duty::from_role(agent.role, pos.y));
+                agent.refresh_attributes();
                 agents.push(agent);
             }
         }
@@ -506,6 +654,7 @@ impl SimulationEngine {
 
         // Base lateral lane and initial line block per team.
         let mut lane_y: HashMap<String, f32> = HashMap::with_capacity(n);
+        let mut mid_depth: HashMap<String, f32> = HashMap::with_capacity(n);
         let mut blocks = [LineBlock::zero(); 2];
         for (team_home, template, xi) in [
             (true, &home_template, &home_xi),
@@ -517,6 +666,28 @@ impl SimulationEngine {
                 let base = template.get(idx).copied().unwrap_or(Vector2::zero());
                 let y = if mirror { -base.y } else { base.y };
                 lane_y.insert(p.player_id.clone(), y);
+            }
+            // Keep the distinct depths of the dynamic midfield template. The
+            // mean stays on the line block, so the unit moves as one while the
+            // holding midfielder / No.10 split remains visible.
+            let mids: Vec<&LineupPlayer> = xi
+                .iter()
+                .filter(|p| p.is_starter() && p.position_category == 3)
+                .collect();
+            if mids.len() >= 2 {
+                let mean = mids
+                    .iter()
+                    .map(|p| {
+                        let idx = (p.formation_slot - 1) as usize;
+                        template.get(idx).copied().unwrap_or(Vector2::zero()).x
+                    })
+                    .sum::<f32>()
+                    / mids.len() as f32;
+                for p in mids {
+                    let idx = (p.formation_slot - 1) as usize;
+                    let x = template.get(idx).copied().unwrap_or(Vector2::zero()).x;
+                    mid_depth.insert(p.player_id.clone(), x - mean);
+                }
             }
             blocks[usize::from(!team_home)] = initial_block(xi, template, team_home);
         }
@@ -551,6 +722,7 @@ impl SimulationEngine {
                 until: first_event_time + 1.0,
                 spot: Vector2::zero(),
                 side: 0.0,
+                taker_id: None,
             })
         } else {
             None
@@ -572,6 +744,8 @@ impl SimulationEngine {
             agents,
             ball: Ball::new(Vector2::zero()),
             possession: None,
+            last_touch: None,
+            last_touch_player: None,
             timeline,
             dispatcher,
             last_actions: Vec::new(),
@@ -582,13 +756,18 @@ impl SimulationEngine {
             set_piece: initial_set_piece,
             pending_kickoff: None,
             blocks,
+            phases: [PhaseTracker::new(); 2],
+            last_plans: [None, None],
             lane_y,
+            mid_depth,
             current_period: 1,
             event_lookup,
             styles,
             hold_line_x: [0.0, 0.0],
             agent_index,
             pending_subs: HashMap::new(),
+            formation_changes: ctx.formation_changes,
+            formation_cursor: 0,
             sim_time: 0.0,
             events_dispatched: 0,
             events_executed: 0,
@@ -596,6 +775,7 @@ impl SimulationEngine {
                 staging_decision: "init",
             landing_snapshots: Vec::new(),
             pending_landing: None,
+            pending_catch: None,
             anchor_buffer,
         };
         // The match opens on a kick-off: start the players in that shape
@@ -661,6 +841,109 @@ impl SimulationEngine {
         &self.agents[idx].team_id
     }
 
+    // ── Overlay analysis snapshot (engine's own scheme, read-only) ──
+    // The renderer keeps the 23×6 positional contract; these small getters
+    // expose velocity, duty, phase and the live team plan alongside it.
+
+    /// Velocity of player `index` in m/s.
+    #[inline]
+    pub fn player_velocity(&self, index: usize) -> Vector2 {
+        self.agents.get(index).map(|a| a.velocity).unwrap_or(Vector2::zero())
+    }
+
+    /// Duty code of player `index`: 0 unknown, 1 GK, 2 CB, 3 FB, 4 DM, 5 CM,
+    /// 6 AM, 7 winger, 8 striker.
+    pub fn player_duty(&self, index: usize) -> u8 {
+        match self.agents.get(index).map(|a| a.duty) {
+            Some(Duty::Goalkeeper) => 1,
+            Some(Duty::CentreBack) => 2,
+            Some(Duty::FullBack) => 3,
+            Some(Duty::DefensiveMid) => 4,
+            Some(Duty::CentralMid) => 5,
+            Some(Duty::AttackingMid) => 6,
+            Some(Duty::Winger) => 7,
+            Some(Duty::Striker) => 8,
+            _ => 0,
+        }
+    }
+
+    /// Intent code of player `index`: 0 hold, 1 anticipate, 2 mark, 3 support,
+    /// 4 press, 5 cover, 6 run.
+    pub fn player_intent(&self, index: usize) -> u8 {
+        use crate::brain::TacticalIntent;
+        match self.agents.get(index).map(|a| a.brain.current_intent) {
+            Some(TacticalIntent::AnticipateEvent { .. }) => 1,
+            Some(TacticalIntent::ManMark { .. }) => 2,
+            Some(TacticalIntent::SupportTriangle { .. }) => 3,
+            Some(TacticalIntent::PressCarrier { .. }) => 4,
+            Some(TacticalIntent::CoverSpace { .. }) => 5,
+            Some(TacticalIntent::TakeRun { .. }) => 6,
+            _ => 0,
+        }
+    }
+
+    /// Phase code for a team: 0 build-up, 1 progression, 2 final third,
+    /// 3 attacking transition, 4 high press, 5 mid-block, 6 low block,
+    /// 7 defensive transition.
+    pub fn team_phase(&self, team: usize) -> u8 {
+        match self.phases.get(team).map(|p| p.phase) {
+            Some(TeamPhase::BuildUp) => 0,
+            Some(TeamPhase::Progression) => 1,
+            Some(TeamPhase::FinalThird) => 2,
+            Some(TeamPhase::AttackingTransition) => 3,
+            Some(TeamPhase::HighPress) => 4,
+            Some(TeamPhase::MidBlock) => 5,
+            Some(TeamPhase::LowBlock) => 6,
+            Some(TeamPhase::DefensiveTransition) => 7,
+            None => 5,
+        }
+    }
+
+    /// Agent index of the team's designated presser, if any (-1).
+    pub fn team_presser(&self, team: usize) -> i32 {
+        self.last_plans
+            .get(team)
+            .and_then(|p| *p)
+            .and_then(|p| p.presser)
+            .map(|i| i as i32)
+            .unwrap_or(-1)
+    }
+
+    /// Agent index of the team's designated cover, if any (-1).
+    pub fn team_cover(&self, team: usize) -> i32 {
+        self.last_plans
+            .get(team)
+            .and_then(|p| *p)
+            .and_then(|p| p.cover)
+            .map(|i| i as i32)
+            .unwrap_or(-1)
+    }
+
+    /// Agent index of the team's designated runner, if any (-1).
+    pub fn team_runner(&self, team: usize) -> i32 {
+        self.last_plans
+            .get(team)
+            .and_then(|p| *p)
+            .and_then(|p| p.runner)
+            .map(|i| i as i32)
+            .unwrap_or(-1)
+    }
+
+    /// Agent index this player is marking, if any (-1).
+    pub fn player_mark(&self, index: usize) -> i32 {
+        let team = self.agents.get(index).map(|a| usize::from(a.team_id != self.home_team_id));
+        match team {
+            Some(t) => self
+                .last_plans
+                .get(t)
+                .and_then(|p| *p)
+                .and_then(|p| p.mark_for(index))
+                .map(|i| i as i32)
+                .unwrap_or(-1),
+            None => -1,
+        }
+    }
+
     /// Convenience accessor for the current ball position.
     #[inline]
     pub fn ball_pos(&self) -> Vector2 {
@@ -698,6 +981,12 @@ impl SimulationEngine {
         self.set_piece.as_ref().map(|s| s.team.as_str())
     }
 
+    /// Current period (1 = first half, 2 = second half, …).
+    #[inline]
+    pub fn current_period(&self) -> u8 {
+        self.current_period
+    }
+
     /// The kind of the active set piece, or `None` during open play.
     pub fn set_piece_kind(&self) -> Option<&'static str> {
         self.set_piece.as_ref().map(|s| match s.kind {
@@ -705,6 +994,8 @@ impl SimulationEngine {
             SetPieceKind::Corner => "corner",
             SetPieceKind::FreeKick => "freekick",
             SetPieceKind::ThrowIn => "throwin",
+            SetPieceKind::Penalty => "penalty",
+            SetPieceKind::GoalKick => "goalkick",
         })
     }
 
@@ -729,7 +1020,12 @@ impl SimulationEngine {
 
         // 1. Dispatcher: anticipation + execution.
         self.last_actions =
-            self.dispatcher.tick(dt, &mut self.agents, Some(self.ball.position));
+            self.dispatcher.tick(
+                dt,
+                &mut self.agents,
+                Some(self.ball.position),
+                crate::dispatcher::SLIP_MAX_SECS,
+            );
         self.sim_time = self.dispatcher.sim_time;
         self.events_dispatched = self.dispatcher.dispatched;
         self.events_executed = self.dispatcher.executed;
@@ -738,7 +1034,10 @@ impl SimulationEngine {
         //     agent, so incoming subs own their own events (no ghost passes).
         self.apply_substitutions();
 
-        // 1c. Ground-truth snapshots: the doer and the ball exactly as the UI
+        // 1c. Mid-match formation changes (type 40) retune the XI in place.
+        self.apply_formation_changes();
+
+        // 1d. Ground-truth snapshots: the doer and the ball exactly as the UI
         //     sees them at the dispatch instant, before choreography moves
         //     anything. This is the measurement contract for accuracy.
         for action in &self.last_actions {
@@ -749,6 +1048,7 @@ impl SimulationEngine {
             self.event_snapshots.push(EventSnapshot {
                 event_id: action.event_id,
                 feed_time: action.feed_time,
+                display_time: action.display_time,
                 sim_time: self.sim_time,
                 type_id: action.type_id,
                 origin: action.origin,
@@ -802,10 +1102,21 @@ impl SimulationEngine {
             _ => {}
         }
         self.update_set_piece();
+        self.update_phases(dt);
         self.update_anchors();
 
         // 5. Utility-AI decision + context steering for all agents.
-        crate::brain::step_agents(
+        let phases = [self.phases[0].phase, self.phases[1].phase];
+        let lookahead = self.dispatcher.lookahead_blocks(
+            &self.home_team_id,
+            &self.away_team_id,
+            self.sim_time,
+            self.dispatcher.lookahead_window,
+        );
+        // Keep the plans: the overlay reads the engine's own scheme instead
+        // of re-deriving pressers, covers, marks and runners.
+        let set_piece_taker = self.set_piece.as_ref().and_then(|sp| sp.taker_id.clone());
+        self.last_plans = crate::brain::step_agents(
             &mut self.agents,
             &self.anchor_buffer,
             &self.event_lookup,
@@ -814,8 +1125,11 @@ impl SimulationEngine {
             self.possession.as_deref(),
             &self.home_team_id,
             &self.styles,
+            &phases,
+            &lookahead,
             &self.hold_line_x,
             self.set_piece.is_some(),
+            set_piece_taker.as_deref(),
             dt,
         );
 
@@ -1003,39 +1317,91 @@ impl SimulationEngine {
         if action.type_id == EVENT_TYPE_CORNER {
             // The award records where the ball left play; the restart itself
             // is taken from the corner arc, and the separate pass that
-            // follows is logged there. Put the ball (and therefore the taker)
-            // on the flag now so the kick fires from under their boot — the
-            // doer still goes to `action.origin`, the spot the feed gave.
-            let taker = if action.origin.x >= 0.0 {
+            // follows is logged there. Lock the taker and the spot to that
+            // pass now so the ball, the anchor and the feed agree; otherwise
+            // the player standing over the ball may not be the actual doer
+            // and the readiness gate stalls the corner.
+            let team = if action.origin.x >= 0.0 {
                 self.home_team_id.clone()
             } else {
                 self.away_team_id.clone()
             };
-            let flag = Vector2::new(
+            let canonical = Vector2::new(
                 if action.origin.x >= 0.0 { 52.0 } else { -52.0 },
                 if action.origin.y >= 0.0 { 33.5 } else { -33.5 },
             );
+            let (taker_id, flag) = match self.next_restart_actor(&team, canonical, 14.0, None) {
+                Some((id, origin)) => (Some(id), origin),
+                None => (self.nearest_taker(&team, canonical), canonical),
+            };
             self.bring_ball_to(flag);
             self.set_piece = Some(SetPiece {
                 kind: SetPieceKind::Corner,
-                team: taker,
+                team,
                 until: self.restart_until(20.0),
                 spot: flag,
                 side: if action.origin.y >= 0.0 { 1.0 } else { -1.0 },
+                taker_id,
             });
             return;
         }
         // Other dead-ball restarts (out) and fouls: bring the ball to the spot.
         if is_dead_ball_event(action.type_id) || action.type_id == EVENT_TYPE_FOUL {
+            // Fouls arrive as twin rows: offender first, then the fouled side.
+            // Only the fouled side's row owns the restart. If a twin foul by
+            // the other team follows at the same spot within a few seconds,
+            // this is the offender's row — skip arming entirely.
+            let mut arm_set_piece = true;
+            if action.type_id == EVENT_TYPE_FOUL {
+                let events = self.dispatcher.events();
+                let start = self.dispatcher.cursor();
+                let is_offender_row = events[start..].iter().any(|e| {
+                    e.type_id == EVENT_TYPE_FOUL
+                        && e.team_id != action.team_id
+                        && (e.origin_x - action.origin.x).abs() <= 1.0
+                        && (e.origin_y - action.origin.y).abs() <= 1.0
+                        && e.match_time_secs >= action.feed_time
+                        && e.match_time_secs - action.feed_time <= 5.0
+                });
+                if is_offender_row {
+                    arm_set_piece = false;
+                }
+            }
+            let mut team = action.team_id.clone();
+            // If the awarded team put the ball out, the restart goes to the other side.
+            if !is_dead_ball_event(action.type_id) && action.type_id != EVENT_TYPE_FOUL && action.type_id != EVENT_TYPE_CORNER {
+                if self.last_touch.as_deref() == Some(team.as_str()) {
+                    team = if team == self.home_team_id { self.away_team_id.clone() } else { self.home_team_id.clone() };
+                }
+            }
+            let exclude = if action.type_id == EVENT_TYPE_FOUL {
+                Some(action.player_id.as_str())
+            } else {
+                None
+            };
+            let taker_id = self
+                .next_restart_actor(&team, action.origin, 14.0, exclude)
+                .map(|(id, _)| id)
+                .or_else(|| self.nearest_taker(&team, action.origin));
             self.bring_ball_to(action.origin);
+            // Fouls arrive as twin rows (offender outcome=1 first, fouled
+            // side outcome=0 second): each arms the restart in turn, so the
+            // fouled side's row owns it. Keep the feed's team — do not flip.
+            // Penalty fouls (Q9) become a spot kick.
             let kind = if action.type_id == EVENT_TYPE_FOUL {
-                SetPieceKind::FreeKick
+                if action.penalty {
+                    SetPieceKind::Penalty
+                } else {
+                    SetPieceKind::FreeKick
+                }
+            } else if action.origin.x.abs() > 46.0 {
+                // Out over the goal line: a goal kick, not a throw.
+                SetPieceKind::GoalKick
             } else {
                 SetPieceKind::ThrowIn
             };
             // The loader leaves the awarded team on an out row — the restart
-            // goes to whoever did not put the ball out — and fouls are
-            // already logged against the offender.
+            // goes to whoever did not put the ball out.
             //
             // The set piece must stay armed until the restart is actually
             // taken (the next event), otherwise the wall/throw-in shape
@@ -1047,13 +1413,16 @@ impl SimulationEngine {
             let until = next_at
                 .map(|t| t + 2.0)
                 .unwrap_or_else(|| self.restart_until(14.0));
-            self.set_piece = Some(SetPiece {
-                kind,
-                team: action.team_id.clone(),
-                until,
-                spot: action.origin,
-                side: 0.0,
-            });
+            if arm_set_piece {
+                self.set_piece = Some(SetPiece {
+                    kind,
+                    team: team.clone(),
+                    until,
+                    spot: action.origin,
+                    side: 0.0,
+                    taker_id,
+                });
+            }
             return;
         }
         // Substitutions, cards, etc. never touch the ball.
@@ -1065,7 +1434,6 @@ impl SimulationEngine {
         };
         let pos = self.agents[idx].position;
         let heading = self.agents[idx].heading;
-        let is_shot = matches!(action.type_id, 13..=16);
 
         // ═══════════════════════════════════════════════════════════════════
         // OPTA FIDELITY: the event says player X at position Y does this
@@ -1079,56 +1447,81 @@ impl SimulationEngine {
         self.ball.attach_to(action.player_id.clone(), pos, heading);
 
         if let Some(target) = action.target {
-            // Pass / shot / clearance with a known destination. Launch from the
-            // ball's *current* position (never snap it to the actor), so a new
-            // event can't teleport the ball across the pitch. When the ball is
-            // attached to the passer it is already at their feet.
-            let natural = self.ball.natural_flight_time(target, action.is_aerial, is_shot);
-            // The ball should land when the intended receiver arrives. Extend
-            // the flight (never shorten below natural) to match them, so the
-            // ball is not "passed to ghosts".
-            let receiver_eta = action
-                .receiver_id
-                .as_deref()
-                .and_then(|rid| self.agent_index(rid))
-                .map(|i| {
-                    let a = &self.agents[i];
-                    arrival_time(a.position.distance(target), a.max_speed_sprint, a.max_accel)
-                });
-            let next_eta = self
-                .dispatcher
-                .peek_next()
-                .map(|next| next.match_time_secs - self.sim_time);
-            // Land when the receiver arrives — but never later than the *next*
-            // event, so the ball is already at that action's spot when it
-            // fires (the ball must not still be mid-flight from a pass nobody
-            // has "made" yet). Never fly faster than the natural pace.
-            let want = match (receiver_eta, next_eta) {
-                (Some(r), Some(n)) => r.min(n),
-                (Some(r), None) => r,
-                (None, Some(n)) => n,
-                (None, None) => natural,
+            // Pass / shot / clearance with a known destination.
+            //
+            // WS1: the event graph decides the endpoint. A completed pass
+            // flies to its target with a kind-true flight (never stretched to
+            // fit a receiver — the receiver is routed to the landing point).
+            // A failed pass ends at the interception point or the touchline,
+            // and NOBODY is routed onto it.
+            let failed_end = if matches!(action.type_id, 1 | 2 | 74)
+                && !crate::event_graph::is_completed_pass_like(
+                    action.type_id,
+                    action.outcome,
+                    action.outcome_reason,
+                ) {
+                self.dispatcher.failed_endpoint(action.event_id, &self.agents)
+            } else {
+                None
             };
-            let duration = want.max(natural);
-            self.ball
-                .launch_with_duration(target, action.is_aerial, is_shot, duration);
-            // Remember the landing so the accuracy harness can measure the
-            // receiver against the exact touchdown point.
-            self.pending_landing = Some((target, action.receiver_id.clone()));
+            let target = failed_end.unwrap_or(target);
+            let is_shot = matches!(action.type_id, 13..=16);
+            if is_shot {
+                self.launch_shot(&action, target);
+            } else {
+                let bend = curve_bend(&action);
+                // Kick-off passes (Q279) are soft taps to the second kicker,
+                // not driven balls: the feed's target is where the next touch
+                // happens, not the pass destination. Cap the tap at 2.5 m —
+                // the coordination budget below still paces it to the taker.
+                let target = match action.pass_kind {
+                    PassKind::KickoffStart | PassKind::KickoffRestart => {
+                        tap_target(action.origin, target)
+                    }
+                    _ => target,
+                };
+                // Coordination budget (WS1): the flight stays kind-true, but
+                // it may hang a beat so the feed-proven owner arrives with it
+                // — a linked receiver up to +1.5 s, an interceptor up to
+                // +1.0 s. Never shortened, never stretched to the next event.
+                let natural = self.ball.position.distance(target)
+                    / crate::ball::pass_speed(action.pass_kind).max(1.0);
+                let owner_eta = owner_eta(&self.agents, &action, target, failed_end.is_some());
+                let cap = if failed_end.is_some() { 1.0 } else { 1.5 };
+                let duration = match owner_eta {
+                    Some(eta) => natural.max((eta - 0.3).min(natural + cap)),
+                    None => natural.max(0.35),
+                };
+                self.ball.launch_for_kind_with_duration(
+                    target,
+                    action.pass_kind,
+                    bend,
+                    action.is_aerial,
+                    duration,
+                );
+                // Through-balls and long releases keep rolling; parries skid.
+                match action.pass_kind {
+                    PassKind::ThroughBall | PassKind::LongBall | PassKind::Switch => {
+                        self.ball.set_landing_roll(5.0, 4.5);
+                    }
+                    _ => {}
+                }
+                // Remember the landing so the accuracy harness can measure the
+                // receiver against the exact touchdown point. Failed passes
+                // name no receiver — the interceptor owns the endpoint.
+                let receiver = if failed_end.is_some() {
+                    None
+                } else {
+                    action.receiver_id.clone()
+                };
+                self.pending_landing = Some((target, receiver));
+            }
         } else if matches!(action.type_id, 13..=16) {
-            // Shots carry no destination in the feed. Compute a goal-mouth
-            // target so a goal goes *in* and a miss goes wide of the post
-            // (otherwise the ball just sits on the shooter and every shot
-            // looks like a goal).
-            let target = self.shot_target(
-                &action.team_id,
-                action.type_id,
-                &action.player_id,
-                action.is_own_goal,
-            );
-            let natural = self.ball.natural_flight_time(target, false, true);
-            self.ball
-                .launch_with_duration(target, false, true, natural);
+            // Shots with no Q140/141 destination: the feed truth (Q102/103
+            // goal-mouth, Q230/231 keeper, Q173-183 save style) decides the
+            // target — never an invented placement.
+            let target = self.shot_target(&action);
+            self.launch_shot(&action, target);
         } else {
             // Possession (take-on, tackle, carry): the ball must sit at the
             // event's spot at the actor's feet. Pre-positioning has usually
@@ -1143,38 +1536,154 @@ impl SimulationEngine {
         }
     }
 
-    /// Compute a goal-mouth (or wide) target for a shot that has no explicit
-    /// destination in the feed.
+    /// Launch a shot at SHOT_SPEED with the keeper reacting: dive lunge plus
+    /// hold/parry/rebound landing behaviour. Shared by shots with an explicit
+    /// Q140/141 destination and shots resolved from goal-mouth truth.
+    fn launch_shot(&mut self, action: &DispatchedAction, target: Vector2) {
+        self.ball.launch(target, false, true);
+        self.keeper_dive(action, target);
+        self.pending_landing = Some((target, None));
+    }
+
+    /// Goal-mouth (or wide) target for a shot, from the feed's own geometry.
     ///
     /// `own_goal` flips the target: an own goal must fly into the *scorer's*
     /// own net, i.e. the goal at the opposite end from the one his team
-    /// attacks.
-    fn shot_target(&self, team_id: &str, type_id: u16, player_id: &str, own_goal: bool) -> Vector2 {
-        let dir = self
-            .directions
-            .get(team_id)
-            .copied()
-            .unwrap_or(AttackDirection::LeftToRight);
-        let attack_goal_x = match dir {
-            AttackDirection::LeftToRight => PITCH_HALF_LENGTH,
-            AttackDirection::RightToLeft => -PITCH_HALF_LENGTH,
+    /// attacks. There is no hash, no flair, no invented placement: goals use
+    /// the recorded Q102/103 spot inside the posts; saved shots go on target
+    /// within the keeper's reach (the dive/parry reads on the ball, never a
+    /// visual goal); posts hit the frame; misses go wide. The deterministic
+    /// fallbacks (no Q102/103, e.g. synthetic feeds) aim off-centre away from
+    /// the keeper or wide by zone — documented, never random.
+    fn shot_target(&self, action: &DispatchedAction) -> Vector2 {
+        let attack_dx = if action.team_id == self.home_team_id {
+            1.0
+        } else {
+            -1.0
         };
-        let goal_x = if own_goal { -attack_goal_x } else { attack_goal_x };
-        let a = PlayerAttributes::from_id(player_id);
+        let goal_x = if action.is_own_goal {
+            -attack_dx * PITCH_HALF_LENGTH
+        } else {
+            attack_dx * PITCH_HALF_LENGTH
+        };
+        // Deterministic side fallback: the shooter's flank, else +1.
+        let flank = if action.origin.y >= 0.0 { 1.0 } else { -1.0 };
+        let mouth = action.goalmouth.and_then(|(y102, z103)| {
+            let a = action.team_id == self.home_team_id;
+            let dx = if a { 1.0 } else { -1.0 };
+            Some((((y102 - 50.0) * 0.68 * dx).clamp(-3.66, 3.66), z103))
+        });
+        let keeper_lat = action.keeper_xy.map(|(_, y231)| {
+            let dx = if action.team_id == self.home_team_id {
+                1.0
+            } else {
+                -1.0
+            };
+            ((y231 - 50.0) * 0.68 * dx).clamp(-4.5, 4.5)
+        });
         let goal_half = 3.66;
-        let side = if a.aggression >= 0.5 { 1.0 } else { -1.0 };
-        match type_id {
-            // Goal: inside the posts.
-            EVENT_TYPE_GOAL => Vector2::new(goal_x * 0.99, (a.flair - 0.5) * (goal_half - 0.8) * 2.0),
-            // Saved: on target, keeper gets there.
-            15 => Vector2::new(goal_x * 0.99, (a.flair - 0.5) * goal_half * 2.0),
-            // Post: onto the frame, right at the upright.
-            14 => Vector2::new(goal_x, side * goal_half),
-            // Miss: wide of the post (side chosen by the shooter's attributes).
+        match action.type_id {
+            // Goal: the recorded spot, inside the posts. Fallback: off-centre
+            // away from the keeper (or the shooter's flank when unknown).
+            EVENT_TYPE_GOAL => {
+                let lat = mouth
+                    .map(|(lat, _)| lat)
+                    .unwrap_or_else(|| match keeper_lat {
+                        Some(k) => (if k >= 0.0 { -1.4 } else { 1.4 }),
+                        None => flank * 1.4,
+                    });
+                Vector2::new(goal_x * 0.99, lat.clamp(-3.4, 3.4))
+            }
+            // Saved: on target, inside the keeper's reach. Held claims
+            // (collected/standing/hands) fly at the keeper's body; parries fly
+            // at the recorded spot and skid wide on landing (see below).
+            15 => {
+                let lat = mouth.map(|(lat, _)| lat).unwrap_or_else(|| {
+                    keeper_lat
+                        .map(|k| (k + flank * 1.0).clamp(-3.2, 3.2))
+                        .unwrap_or(flank * 1.6)
+                });
+                Vector2::new(goal_x * 0.99, lat.clamp(-3.4, 3.4))
+            }
+            // Post: onto the frame at the recorded side, else the flank post.
+            14 => {
+                let side = mouth
+                    .map(|(lat, _)| if lat >= 0.0 { 1.0 } else { -1.0 })
+                    .unwrap_or(flank);
+                Vector2::new(goal_x, side * goal_half)
+            }
+            // Miss: wide of the post by zone (fallback 2 m). Side from the
+            // recorded spot, the keeper's opposite, or the shooter's flank.
             _ => {
-                let wide = goal_half + 1.2 + a.flair * 3.0;
+                let side = mouth
+                    .map(|(lat, _)| if lat.abs() > 3.66 { lat.signum() } else { flank })
+                    .unwrap_or_else(|| {
+                        keeper_lat
+                            .map(|k| if k >= 0.0 { -1.0 } else { 1.0 })
+                            .unwrap_or(flank)
+                    });
+                let wide = goal_half + 2.0;
                 Vector2::new(goal_x, side * wide)
             }
+        }
+    }
+
+    /// Keeper reaction to a shot: lunge the defending keeper toward the shot
+    /// line and set the ball's landing behaviour (hold vs parry vs rebound).
+    ///
+    /// Held claims (collected/standing/hands) attach on landing; everything
+    /// else skids on with a wide residual so a saved shot never reads as a
+    /// goal. The dive is a bounded `receiver_task` sprint — the brain honours
+    /// it as a hard constraint and it expires on its own.
+    fn keeper_dive(&mut self, action: &DispatchedAction, target: Vector2) {
+        // Conceding side: the opponent, except on own goals (own team).
+        let conceding = if action.is_own_goal {
+            action.team_id.clone()
+        } else if action.team_id == self.home_team_id {
+            self.away_team_id.clone()
+        } else {
+            self.home_team_id.clone()
+        };
+        let keeper_idx = self
+            .agents
+            .iter()
+            .position(|a| a.team_id == conceding && a.is_goalkeeper);
+        let Some(ki) = keeper_idx else { return };
+        let keeper_pos = self.agents[ki].position;
+
+        // Dive toward the shot, capped at a credible 3.5 m lunge.
+        let shot_dir = (target - action.origin).normalize();
+        let to_shot = target - keeper_pos;
+        let dive = keeper_pos + to_shot.truncate(3.5);
+        let flight_secs = (self.ball.position.distance(target) / crate::ball::SHOT_SPEED).max(0.35);
+        self.agents[ki].receiver_task = Some((dive, self.sim_time + flight_secs));
+        let _ = shot_dir;
+
+        match action.type_id {
+            // Held: the keeper gathers it — attach on landing.
+            15 if matches!(
+                action.keeper_action,
+                KeeperAction::Collected | KeeperAction::Standing | KeeperAction::Hands
+            ) =>
+            {
+                self.pending_catch = Some(self.agents[ki].id.clone());
+            }
+            // Parried/diving save: the ball lands on target, then skids back
+            // out wide — toward the field and the shot side — so a saved shot
+            // never trickles over the line after the whistle.
+            15 => {
+                let side = if target.y >= 0.0 { 1.0 } else { -1.0 };
+                let out = Vector2::new(
+                    target.x - attack_goal_sign(&action, self) * 4.0,
+                    side * 8.0,
+                ) - target;
+                self.ball.set_landing_deflect(out, 7.0, 4.0);
+            }
+            // Post: frame rebound back into play.
+            14 => {
+                self.ball.set_landing_roll(4.5, 5.0);
+            }
+            _ => {}
         }
     }
 
@@ -1191,9 +1700,12 @@ impl SimulationEngine {
         let dir = if home_attacking { 1.0 } else { -1.0 };
         let defending_home = !home_attacking;
         let second = crate::brain::second_last_progress(
-            self.agents
-                .iter()
-                .map(|a| (a.position.x, a.team_id == self.home_team_id)),
+            self.agents.iter().filter(|a| !a.sent_off).map(|a| {
+                (
+                    a.position.x,
+                    a.team_id == self.home_team_id,
+                )
+            }),
             defending_home,
             dir,
         );
@@ -1270,6 +1782,17 @@ impl SimulationEngine {
                 self.pending_kickoff = Some((conceding, at));
             }
         }
+        // A red card (straight or second yellow) dismisses the player: the
+        // side plays the rest short-handed.
+        if action.type_id == EVENT_TYPE_CARD
+            && matches!(
+                action.card,
+                CardKind::Red | CardKind::SecondYellow
+            )
+            && !action.player_id.is_empty()
+        {
+            self.dismiss_player(&action.player_id.clone());
+        }
         let player = self
             .agent_index(&action.player_id)
             .map(|i| self.agents[i].id.clone())
@@ -1278,7 +1801,7 @@ impl SimulationEngine {
             self.recent_events.pop_front();
         }
         self.recent_events.push_back(EventRecord {
-            time: action.feed_time,
+            time: action.display_time,
             type_id: action.type_id,
             label: if own_goal {
                 "Own Goal"
@@ -1315,6 +1838,14 @@ impl SimulationEngine {
             && !matches!(self.ball.state, BallState::InFlight { .. })
             && !was_reposition
         {
+            // A held claim lands in the keeper's hands, not on the grass.
+            if let Some(keeper_id) = self.pending_catch.take() {
+                if let Some(&ki) = self.agent_index.get(&keeper_id) {
+                    let kpos = self.agents[ki].position;
+                    let khead = self.agents[ki].heading;
+                    self.ball.attach_to(keeper_id.clone(), kpos, khead);
+                }
+            }
             if let Some((target, receiver_id)) = self.pending_landing.take() {
                 let receiver_pos = receiver_id
                     .as_deref()
@@ -1396,6 +1927,152 @@ impl SimulationEngine {
         let team = next.team_id.clone();
         self.pending_kickoff = None;
         self.start_kickoff(&team);
+        // A period restart has no interval to walk into shape. Set the
+        // anchors, then place the two kickers physically inside the circle so
+        // the first event of the half is not taken from 20 m away.
+        let dir = if team == self.home_team_id { 1.0 } else { -1.0 };
+        let (taker, second) = self.position_kickoff(&team, dir);
+        self.snap_kickoff_pair(taker.as_deref(), second.as_deref());
+    }
+
+    /// Apply due mid-match formation changes (type 40). Each row renames the
+    /// XI in place: agents keep their bodies, but their role, duty, lane,
+    /// line depth and team style switch to the new shape within a tick or two
+    /// (anchors glide via the normal rate limits — no teleport).
+    fn apply_formation_changes(&mut self) {
+        while self.formation_cursor < self.formation_changes.len()
+            && self.formation_changes[self.formation_cursor].match_time_secs <= self.sim_time
+        {
+            let fc = self.formation_changes[self.formation_cursor].clone();
+            self.formation_cursor += 1;
+            self.retune_team_shape(&fc.team_id, &fc.lineup);
+        }
+    }
+
+    /// Rebuild one team's shape from a new XI: roles, duties, lanes, line
+    /// depths, block and style. Agents not named in the row keep their jobs.
+    fn retune_team_shape(&mut self, team_id: &str, lineup: &[LineupPlayer]) {
+        let xi: Vec<LineupPlayer> = lineup.iter().filter(|p| p.is_starter()).cloned().collect();
+        if xi.is_empty() {
+            return;
+        }
+        let team_home = team_id == self.home_team_id;
+        let team_idx = usize::from(!team_home);
+        let template = FormationEngine::dynamic_template(&xi)
+            .unwrap_or_else(|| self.formation.template_vec(DEFAULT_FORMATION));
+        let duties = Duty::from_lineup(&xi, &template);
+        // Roles, duties and attributes follow the new slots.
+        for p in &xi {
+            let Some(&idx) = self.agent_index.get(&p.player_id) else {
+                continue;
+            };
+            let a = &mut self.agents[idx];
+            a.role = PlayerRole::from_category(p.position_category);
+            a.is_goalkeeper = a.role == PlayerRole::Goalkeeper;
+            a.duty = duties
+                .get(&p.player_id)
+                .copied()
+                .unwrap_or_else(|| Duty::from_role(a.role, a.position.y));
+            a.refresh_attributes();
+        }
+        // Lanes + line depths from the new template (mirrored for away).
+        let mirror = !team_home;
+        for p in &xi {
+            let idx = (p.formation_slot.saturating_sub(1)) as usize;
+            let base = template.get(idx).copied().unwrap_or(Vector2::zero());
+            self.lane_y
+                .insert(p.player_id.clone(), if mirror { -base.y } else { base.y });
+        }
+        let mids: Vec<&LineupPlayer> = xi
+            .iter()
+            .filter(|p| p.position_category == 3)
+            .collect();
+        if mids.len() >= 2 {
+            let mean = mids
+                .iter()
+                .map(|p| {
+                    let idx = (p.formation_slot.saturating_sub(1)) as usize;
+                    template.get(idx).copied().unwrap_or(Vector2::zero()).x
+                })
+                .sum::<f32>()
+                / mids.len() as f32;
+            for p in mids {
+                let idx = (p.formation_slot.saturating_sub(1)) as usize;
+                let x = template.get(idx).copied().unwrap_or(Vector2::zero()).x;
+                self.mid_depth.insert(p.player_id.clone(), x - mean);
+            }
+        }
+        self.blocks[team_idx] = initial_block(&xi, &template, team_home);
+        self.styles[team_idx] =
+            TeamStyle::from_formation(FormationEngine::detect_formation_label(&xi));
+        // Merge the row into the stored roster so re-identification later
+        // sees the current shirts/slots.
+        let entry = self.lineups.entry(team_id.to_string()).or_default();
+        for p in xi {
+            if let Some(slot) = entry.iter_mut().find(|e| e.player_id == p.player_id) {
+                *slot = p;
+            } else {
+                entry.push(p);
+            }
+        }
+    }
+
+    /// Send a player off (red card): freeze them out of the team's plans and
+    /// walk them to the touchline bench. The body stays rendered (the walk-off
+    /// reads on screen) but the side plays the rest short-handed.
+    fn dismiss_player(&mut self, player_id: &str) {
+        let Some(&idx) = self.agent_index.get(player_id) else {
+            return;
+        };
+        {
+            let a = &mut self.agents[idx];
+            if a.sent_off {
+                return;
+            }
+            a.sent_off = true;
+            a.assigned_event_id = None;
+            a.receiver_task = None;
+            a.state = AgentState::InFormation;
+            a.sprint_boost = 1.0;
+        }
+        // Touchline bench on the player's own side of the pitch.
+        let side = if self.agents[idx].position.y >= 0.0 { 1.0 } else { -1.0 };
+        let bench = Vector2::new(
+            self.agents[idx].position.x.clamp(-40.0, 40.0),
+            side * 36.5,
+        );
+        self.anchor_buffer.insert(player_id.to_string(), bench);
+        // The shape drops a man: recompute the block without the dismissed.
+        let team_id = self.agents[idx].team_id.clone();
+        self.retune_after_dismissal(&team_id);
+    }
+
+    /// Rebuild a 10-man block after a dismissal (drop a forward, compact).
+    fn retune_after_dismissal(&mut self, team_id: &str) {
+        let xi: Vec<LineupPlayer> = self
+            .lineups
+            .get(team_id)
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let xi: Vec<LineupPlayer> = xi
+            .into_iter()
+            .filter(|p| {
+                p.is_starter()
+                    && self
+                        .agent_index
+                        .get(&p.player_id)
+                        .and_then(|&i| self.agents.get(i))
+                        .map(|a| !a.sent_off)
+                        .unwrap_or(true)
+            })
+            .collect();
+        if xi.len() >= 8 {
+            let team_home = team_id == self.home_team_id;
+            let team_idx = usize::from(!team_home);
+            let template = FormationEngine::dynamic_template(&xi)
+                .unwrap_or_else(|| self.formation.template_vec(DEFAULT_FORMATION));
+            self.blocks[team_idx] = initial_block(&xi, &template, team_home);
+        }
     }
 
     /// Swap a departing player's agent for the substitute coming on, so the
@@ -1436,8 +2113,10 @@ impl SimulationEngine {
             return;
         };
         let pos = self.agents[idx].position;
+        let old_role = self.agents[idx].role;
         let anchor = self.anchor_buffer.remove(old_id).unwrap_or(pos);
         let lane = self.lane_y.remove(old_id);
+        let depth = self.mid_depth.remove(old_id);
         self.agent_index.remove(old_id);
 
         // New identity attributes come from the roster (shirt + position).
@@ -1454,12 +2133,20 @@ impl SimulationEngine {
             let a = &mut self.agents[idx];
             a.id = new_id.to_string();
             a.shirt_number = shirt;
-            a.attributes = PlayerAttributes::from_id(new_id);
-            a.max_speed_sprint = (7.9 + a.attributes.pace * 0.6).min(MAX_SPEED);
             if let Some(cat) = category {
-                a.is_goalkeeper = cat == 1;
-                a.role = PlayerRole::from_category(cat);
+                let incoming = PlayerRole::from_category(cat);
+                // A substitute fills the slot he replaces, so an unknown
+                // category keeps the outgoing role; otherwise a centre-back
+                // would be anchored on the forward line for the rest of the
+                // match.
+                a.role = if incoming == PlayerRole::Unknown {
+                    old_role
+                } else {
+                    incoming
+                };
+                a.is_goalkeeper = a.role == PlayerRole::Goalkeeper;
             }
+            a.refresh_attributes();
             a.assigned_event_id = None;
             a.receiver_task = None;
             a.state = AgentState::InFormation;
@@ -1471,6 +2158,12 @@ impl SimulationEngine {
         if let Some(l) = lane {
             self.lane_y.insert(new_id.to_string(), l);
         }
+        if self.agents[idx].role == PlayerRole::Midfielder {
+            // A substitute takes over the outgoing player's line/depth slot.
+            self.mid_depth.insert(new_id.to_string(), depth.unwrap_or(0.0));
+        } else {
+            self.mid_depth.remove(new_id);
+        }
     }
 
     /// Start a kick-off from the centre spot for `team`.
@@ -1480,22 +2173,87 @@ impl SimulationEngine {
         // placement (teleport checks exempt restarts).
         self.ball.place_at(Vector2::zero());
         // The feed leaves a long celebration gap (often 60–90 s) between the
-        // goal and the kick-off. The set piece must stay armed until the kick
-        // is actually taken, otherwise it expires during the gap and the
-        // centre-circle rules stop being enforced.
+        // goal and the kick-off. The set piece is armed until the kick is
+        // taken — but never frozen longer than a short hold: holding the
+        // defending team in a 5 m kickoff cage for the whole gap (or a
+        // 15-minute half-time) reads as a collapse, not a shape. After the
+        // hold the teams relax to their blocks; the taker stays over the
+        // ball via the pickup rule and the kick still fires on schedule.
         let kickoff_at = self
             .dispatcher
             .peek_next()
             .map(|e| e.match_time_secs)
             .unwrap_or(self.sim_time + 10.0);
-        let until = kickoff_at + 2.0;
+        let until = (kickoff_at + 2.0).min(self.sim_time + KICKOFF_HOLD_SECS);
+        let taker_id = self
+            .next_restart_actor(team, Vector2::zero(), 8.0, None)
+            .map(|(id, _)| id)
+            .or_else(|| self.nearest_taker(team, Vector2::zero()));
         self.set_piece = Some(SetPiece {
             kind: SetPieceKind::KickOff,
             team: team.to_string(),
             until,
             spot: Vector2::zero(),
             side: 0.0,
+            taker_id,
         });
+    }
+
+    /// Update each team's game phase with hysteresis. Possession changes are
+    /// timestamped so a counter-attack window can be recognised for a few
+    /// seconds before the side settles into its normal block.
+    fn update_phases(&mut self, dt: f32) {
+        for team in 0..2 {
+            let team_id = if team == 0 {
+                self.home_team_id.clone()
+            } else {
+                self.away_team_id.clone()
+            };
+            let in_possession = self.possession.as_deref() == Some(team_id.as_str());
+            let attack_dx = if team == 0 { 1.0 } else { -1.0 };
+            let progress = self.ball.position.x * attack_dx;
+            let state = &mut self.phases[team];
+            if in_possession != state.last_in_possession {
+                state.last_in_possession = in_possession;
+                state.changed_at = self.sim_time;
+            }
+            let just_changed = self.sim_time - state.changed_at < 3.5;
+            let desired = if in_possession {
+                if just_changed && progress > -20.0 {
+                    TeamPhase::AttackingTransition
+                } else if progress >= 25.0 {
+                    TeamPhase::FinalThird
+                } else if progress >= -10.0 {
+                    TeamPhase::Progression
+                } else {
+                    TeamPhase::BuildUp
+                }
+            } else if just_changed && progress > -12.0 {
+                TeamPhase::DefensiveTransition
+            } else if progress >= 10.0 {
+                TeamPhase::HighPress
+            } else if progress >= -18.0 {
+                TeamPhase::MidBlock
+            } else {
+                TeamPhase::LowBlock
+            };
+
+            if desired == state.phase {
+                state.candidate = desired;
+                state.candidate_since = 0.0;
+            } else {
+                if desired != state.candidate {
+                    state.candidate = desired;
+                    state.candidate_since = 0.0;
+                }
+                state.candidate_since += dt;
+                let dwell = if desired.is_transition() { 0.18 } else { 0.45 };
+                if state.candidate_since >= dwell {
+                    state.phase = desired;
+                    state.candidate_since = 0.0;
+                }
+            }
+        }
     }
 
     /// Refresh both teams' explicit line blocks and rebuild every anchor from
@@ -1516,12 +2274,15 @@ impl SimulationEngine {
             let in_poss = if team_home { home_in_poss } else { away_in_poss };
             // Opponent's *actual* second-last defender (progress frame) — the
             // real onside bound — falling back to the block proxy only when
-            // fewer than two defenders are known.
+            // fewer than two defenders are known. Dismissed players excluded.
             let defending_home = !team_home;
             let second = crate::brain::second_last_progress(
-                self.agents
-                    .iter()
-                    .map(|a| (a.position.x, a.team_id == self.home_team_id)),
+                self.agents.iter().filter(|a| !a.sent_off).map(|a| {
+                    (
+                        a.position.x,
+                        a.team_id == self.home_team_id,
+                    )
+                }),
                 defending_home,
                 attack_dx,
             );
@@ -1557,7 +2318,11 @@ impl SimulationEngine {
         self.hold_line_x[1] = self.blocks[1].def_x;
 
         // ── 2. Rebuild anchors directly from the block. ──
+        // Sent-off players keep their bench anchor (pinned at dismissal).
         for agent in self.agents.iter() {
+            if agent.sent_off {
+                continue;
+            }
             let team = usize::from(agent.team_id != self.home_team_id);
             let team_home = team == 0;
             let attack_dx = if team_home { 1.0 } else { -1.0 };
@@ -1585,7 +2350,9 @@ impl SimulationEngine {
                     slot.y = lane * width + b.def_y;
                 }
                 PlayerRole::Midfielder => {
-                    slot.x = b.mid_x;
+                    let depth = self.mid_depth.get(&agent.id).copied().unwrap_or(0.0);
+                    let depth_scale = if in_poss { 1.12 } else { 1.0 };
+                    slot.x = b.mid_x + depth * attack_dx * depth_scale;
                     slot.y = lane * width + b.mid_y;
                 }
                 PlayerRole::Forward | PlayerRole::Unknown => {
@@ -1622,11 +2389,81 @@ impl SimulationEngine {
         }
     }
 
-    /// The nearest outfield player of `team` to `ball` (the restart taker).
+    /// The next feed ball event for `team` near the restart spot, as
+/// `(player_id, origin)`. Used to lock the taker before positions move.
+fn next_restart_actor(
+    &self,
+    team: &str,
+    near: Vector2,
+    radius: f32,
+    exclude: Option<&str>,
+) -> Option<(String, Vector2)> {
+    let events = self.dispatcher.events();
+    let start = self.dispatcher.cursor();
+    events[start..]
+        .iter()
+        .take_while(|e| e.match_time_secs - self.sim_time <= 25.0)
+        .filter(|e| e.team_id == team && !e.player_id.is_empty() && is_ball_event(e.type_id))
+        .filter(|e| exclude.map(|x| x != e.player_id).unwrap_or(true))
+        .map(|e| (e.player_id.clone(), Vector2::new(e.origin_x, e.origin_y)))
+        .find(|(_, p)| p.distance(near) <= radius)
+}
+
+/// Resolve the stored taker into a live player id (with a one-time nearest
+/// fallback if the stored one has been substituted off).
+fn resolve_taker(&self, sp: &SetPiece) -> Option<String> {
+    sp.taker_id
+        .as_deref()
+        .filter(|id| self.agent_index.get(*id).is_some_and(|&i| !self.agents[i].sent_off))
+        .map(str::to_string)
+        .or_else(|| self.nearest_taker(&sp.team, sp.spot))
+}
+
+/// Push every non-taker anchor to at least `radius` metres from the restart
+/// spot so nobody crowds the ball.
+fn enforce_set_piece_spacing(&mut self, sp: &SetPiece, taker: Option<&str>, dir: f32) {
+    let radius = match sp.kind {
+        SetPieceKind::Corner => 8.0,
+        SetPieceKind::FreeKick => 6.0,
+        SetPieceKind::Penalty => 9.15,
+        SetPieceKind::ThrowIn => 4.0,
+        SetPieceKind::GoalKick => 5.0,
+        SetPieceKind::KickOff => return,
+    };
+    if radius <= 0.0 {
+        return;
+    }
+    let players: Vec<(String, bool)> = self
+        .agents
+        .iter()
+        .map(|a| (a.id.clone(), a.is_goalkeeper || a.sent_off))
+        .collect();
+    for (id, skip) in players {
+        if skip || Some(id.as_str()) == taker {
+            continue;
+        }
+        let Some(slot) = self.anchor_buffer.get_mut(&id) else {
+            continue;
+        };
+        let delta = *slot - sp.spot;
+        let d = delta.length();
+        if d >= radius {
+            continue;
+        }
+        let away = if d > 1e-3 {
+            delta / d
+        } else {
+            Vector2::new(-dir, 0.0)
+        };
+        *slot = (sp.spot + away * radius).clamp_on_pitch();
+    }
+}
+
+/// The nearest outfield player of `team` to `ball` (the restart taker).
     fn nearest_taker(&self, team: &str, ball: Vector2) -> Option<String> {
         self.agents
             .iter()
-            .filter(|a| a.team_id == team && !a.is_goalkeeper)
+            .filter(|a| a.team_id == team && !a.is_goalkeeper && !a.sent_off)
             .min_by(|a, b| {
                 a.position
                     .distance(ball)
@@ -1652,7 +2489,10 @@ impl SimulationEngine {
             .agents
             .iter()
             .filter(|a| {
-                a.team_id == team && !a.is_goalkeeper && Some(a.id.as_str()) != exclude
+                a.team_id == team
+                    && !a.is_goalkeeper
+                    && !a.sent_off
+                    && Some(a.id.as_str()) != exclude
             })
             .map(|a| {
                 let pri = match (attacking, a.role) {
@@ -1679,27 +2519,34 @@ impl SimulationEngine {
     fn position_set_piece(&mut self, sp: &SetPiece) {
         let dir = if sp.team == self.home_team_id { 1.0 } else { -1.0 };
         let ball = sp.spot;
+        let taker = self.resolve_taker(sp);
         match sp.kind {
-            SetPieceKind::KickOff => self.position_kickoff(&sp.team, dir),
-            SetPieceKind::Corner => self.position_corner(&sp.team, dir, sp.side, ball),
-            SetPieceKind::FreeKick => self.position_free_kick(&sp.team, dir, ball),
-            SetPieceKind::ThrowIn => {
-                if let Some(id) = self.nearest_taker(&sp.team, ball) {
-                    if let Some(slot) = self.anchor_buffer.get_mut(&id) {
-                        *slot = ball;
-                    }
-                }
+            SetPieceKind::KickOff => {
+                self.position_kickoff(&sp.team, dir);
             }
+            SetPieceKind::Corner => self.position_corner(&sp.team, dir, sp.side, ball, taker.as_deref()),
+            SetPieceKind::FreeKick => self.position_free_kick(&sp.team, dir, ball, taker.as_deref()),
+            SetPieceKind::ThrowIn => self.position_throw_in(&sp.team, dir, ball, taker.as_deref()),
+            SetPieceKind::Penalty => self.position_penalty(&sp.team, dir, ball, taker.as_deref()),
+            SetPieceKind::GoalKick => self.position_goal_kick(&sp.team, dir, ball, taker.as_deref()),
         }
+        self.enforce_set_piece_spacing(sp, taker.as_deref(), dir);
     }
 
     /// Kick-off: ball on the spot, two kickers, everyone else in their own
     /// half with the defending team outside the centre circle.
-    fn position_kickoff(&mut self, team: &str, dir: f32) {
+    ///
+    /// Returns the chosen taker and second kicker so a period restart can
+    /// place those two bodies inside the circle immediately.
+    fn position_kickoff(
+        &mut self,
+        team: &str,
+        dir: f32,
+    ) -> (Option<String>, Option<String>) {
         let mut own: Vec<String> = self
             .agents
             .iter()
-            .filter(|a| a.team_id == team && !a.is_goalkeeper)
+            .filter(|a| a.team_id == team && !a.is_goalkeeper && !a.sent_off)
             .map(|a| a.id.clone())
             .collect();
         own.sort();
@@ -1711,11 +2558,12 @@ impl SimulationEngine {
             .peek_next()
             .filter(|e| e.team_id == team)
             .and_then(|e| self.agent_index.get(&e.player_id).copied())
+            .filter(|&i| !self.agents[i].sent_off)
             .map(|i| self.agents[i].id.clone());
         let taker = scheduled.or_else(|| {
             self.agents
                 .iter()
-                .filter(|a| a.team_id == team && !a.is_goalkeeper)
+                .filter(|a| a.team_id == team && !a.is_goalkeeper && !a.sent_off)
                 .min_by(|a, b| {
                     a.position
                         .length()
@@ -1740,6 +2588,7 @@ impl SimulationEngine {
         }
         for agent in self.agents.iter() {
             if agent.is_goalkeeper
+                || agent.sent_off
                 || Some(&agent.id) == taker.as_ref()
                 || Some(&agent.id) == second.as_ref()
             {
@@ -1755,6 +2604,31 @@ impl SimulationEngine {
             let limit = if agent.team_id == team { -2.0 } else { -10.0 };
             let prog = (slot.x * a_dir).min(limit);
             slot.x = prog * a_dir;
+        }
+        (taker, second)
+    }
+
+    /// Place the two period-restart kickers physically inside the centre
+    /// circle. A half-time break has no simulated walking time, so waiting for
+    /// them to jog to their anchors would let the first second-half event fire
+    /// with nobody at the spot. This is intentionally limited to period
+    /// restarts; goal celebrations keep the normal walk-back.
+    fn snap_kickoff_pair(&mut self, taker: Option<&str>, second: Option<&str>) {
+        for id in [taker, second].into_iter().flatten() {
+            let Some(slot) = self.anchor_buffer.get(id).copied() else {
+                continue;
+            };
+            let Some(idx) = self.agent_index.get(id).copied() else {
+                continue;
+            };
+            let agent = &mut self.agents[idx];
+            agent.position = slot;
+            agent.prev_position = slot;
+            agent.velocity = Vector2::zero();
+            agent.acceleration = Vector2::zero();
+            agent.state = crate::agent::AgentState::InFormation;
+            agent.assigned_event_id = None;
+            agent.receiver_task = None;
         }
     }
 
@@ -1790,7 +2664,7 @@ impl SimulationEngine {
 
     /// Corner: the taker at the flag, the attack filling the box with real
     /// roles (near post, far post, penalty spot, edge), the defence zonal.
-    fn position_corner(&mut self, team: &str, dir: f32, side: f32, ball: Vector2) {
+    fn position_corner(&mut self, team: &str, dir: f32, side: f32, ball: Vector2, taker: Option<&str>) {
         let goal_x = dir * PITCH_HALF_LENGTH;
         let near_y = side * 7.0;
         let far_y = -side * 6.0;
@@ -1816,26 +2690,93 @@ impl SimulationEngine {
             Vector2::new(goal_x - dir * 16.0, 0.0),
             Vector2::new(goal_x - dir * 21.0, 0.0),
         ];
-        let taker = self.nearest_taker(team, ball);
-        self.assign_slots(team, true, taker.as_deref(), &attack_slots);
+        self.assign_slots(team, true, taker, &attack_slots);
         let def_team = if team == self.home_team_id {
             self.away_team_id.clone()
         } else {
             self.home_team_id.clone()
         };
         self.assign_slots(&def_team, false, None, &def_slots);
-        if let Some(id) = &taker {
+        if let Some(id) = taker {
             if let Some(slot) = self.anchor_buffer.get_mut(id) {
                 *slot = ball;
             }
         }
     }
 
+    /// Penalty: taker on the spot, keeper on the line, everyone else outside
+    /// the box and the arc.
+    fn position_penalty(&mut self, team: &str, dir: f32, ball: Vector2, taker: Option<&str>) {
+        if let Some(id) = taker {
+            if let Some(slot) = self.anchor_buffer.get_mut(id) {
+                *slot = ball + Vector2::new(-dir * 0.5, 0.0);
+            }
+        }
+        // Keeper holds the line; both teams stay out of the box.
+        let spot_x = ball.x;
+        for agent in self.agents.iter() {
+            if agent.is_goalkeeper || Some(agent.id.as_str()) == taker {
+                continue;
+            }
+            let team_home = agent.team_id == self.home_team_id;
+            let a_dir = if team_home { 1.0 } else { -1.0 };
+            let Some(slot) = self.anchor_buffer.get_mut(&agent.id) else {
+                continue;
+            };
+            // Attackers and defenders alike: goal-side of the D (prog margin).
+            let prog = (slot.x * a_dir).min(if agent.team_id == team {
+                spot_x * a_dir - 9.5
+            } else {
+                spot_x * a_dir - 12.0
+            });
+            slot.x = prog * a_dir;
+        }
+    }
+
+    /// Goal kick: keeper collects at the spot; one short option and one long
+    /// outlet, everyone else in shape. Outlets are the nearest available
+    /// outfielders — never drafted defenders from across the pitch.
+    fn position_goal_kick(&mut self, team: &str, dir: f32, ball: Vector2, taker: Option<&str>) {
+        // Keeper comes for it.
+        if let Some(id) = self
+            .agents
+            .iter()
+            .find(|a| a.team_id == team && a.is_goalkeeper)
+            .map(|a| a.id.clone())
+        {
+            if let Some(slot) = self.anchor_buffer.get_mut(&id) {
+                *slot = ball;
+            }
+        }
+        // A short option and a long outlet from the keeper's team.
+        let short = ball + Vector2::new(dir * 8.0, 6.0);
+        let long = ball + Vector2::new(dir * 30.0, -8.0);
+        let mut candidates: Vec<(f32, String)> = self
+            .agents
+            .iter()
+            .filter(|a| {
+                a.team_id == team && !a.is_goalkeeper && !a.sent_off && a.role != PlayerRole::Goalkeeper
+            })
+            .map(|a| {
+                let d = a
+                    .position
+                    .distance(short)
+                    .min(a.position.distance(long));
+                (d, a.id.clone())
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        for ((_, id), spot) in candidates.into_iter().take(2).zip([short, long]) {
+            if let Some(slot) = self.anchor_buffer.get_mut(&id) {
+                *slot = spot.clamp_on_pitch();
+            }
+        }
+    }
+
     /// Free kick: the taker behind the ball and a physical wall between the
     /// ball and the goal being attacked.
-    fn position_free_kick(&mut self, team: &str, dir: f32, ball: Vector2) {
-        let taker = self.nearest_taker(team, ball);
-        if let Some(id) = &taker {
+    fn position_free_kick(&mut self, team: &str, dir: f32, ball: Vector2, taker: Option<&str>) {
+        if let Some(id) = taker {
             let back = Vector2::new(-dir * 0.9, 0.0);
             if let Some(slot) = self.anchor_buffer.get_mut(id) {
                 *slot = ball + back;
@@ -1853,7 +2794,7 @@ impl SimulationEngine {
         let mut ids: Vec<String> = self
             .agents
             .iter()
-            .filter(|a| a.team_id == def_team && !a.is_goalkeeper)
+            .filter(|a| a.team_id == def_team && !a.is_goalkeeper && !a.sent_off)
             .map(|a| a.id.clone())
             .collect();
         ids.sort();
@@ -1865,9 +2806,64 @@ impl SimulationEngine {
         }
     }
 
-    /// Set possession to the team of the nearest upcoming event.
+    /// Throw-in: the taker at the ball plus two short options infield.
+    fn position_throw_in(&mut self, team: &str, dir: f32, ball: Vector2, taker: Option<&str>) {
+        if let Some(id) = taker {
+            if let Some(slot) = self.anchor_buffer.get_mut(id) {
+                *slot = ball;
+            }
+        }
+        let infield = if ball.y >= 0.0 { -1.0 } else { 1.0 };
+        let short = (ball + Vector2::new(dir * 5.0, infield * 4.0)).clamp_on_pitch();
+        let long = (ball + Vector2::new(dir * 11.0, infield * 8.0)).clamp_on_pitch();
+        let mut candidates: Vec<(f32, String)> = self
+            .agents
+            .iter()
+            .filter(|a| {
+                a.team_id == team
+                    && !a.is_goalkeeper
+                    && !a.sent_off
+                    && Some(a.id.as_str()) != taker
+            })
+            .map(|a| {
+                let d = a
+                    .position
+                    .distance(short)
+                    .min(a.position.distance(long));
+                (d, a.id.clone())
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        for ((_, id), spot) in candidates.into_iter().take(2).zip([short, long]) {
+            if let Some(slot) = self.anchor_buffer.get_mut(&id) {
+                *slot = spot;
+            }
+        }
+    }
+
+    /// Set possession to the team that just won the ball: the actor's team on
+    /// every dispatched ball action, except failed passes (in dispute until
+    /// the next touch) and fouls (the restart goes to the fouled side, read
+    /// from the next event). Persists across quiet ticks; falls back to the
+    /// next event's team before anything has been won.
     fn update_possession(&mut self) {
-        self.possession = self.dispatcher.peek_next().map(|e| e.team_id.clone());
+        for action in &self.last_actions {
+            if !crate::parser::is_ball_event(action.type_id) {
+                continue;
+            }
+            if matches!(action.type_id, 1 | 2) && !action.outcome {
+                continue; // failed pass: still in dispute
+            }
+            if action.type_id == EVENT_TYPE_FOUL {
+                continue; // offender touched it; the restart decides
+            }
+            self.last_touch = Some(action.team_id.clone());
+            self.last_touch_player = Some(action.player_id.clone());
+        }
+        self.possession = self
+            .last_touch
+            .clone()
+            .or_else(|| self.dispatcher.peek_next().map(|e| e.team_id.clone()));
     }
 
     /// Run `seconds` of simulation at the configured fixed timestep.
@@ -1965,22 +2961,11 @@ mod engine_tests {
     }
 
     fn event(id: u64, time: f32, team: &str, player: &str, x: f32, y: f32, aerial: bool) -> NormalizedEvent {
-        NormalizedEvent {
-            id,
-            type_id: 1,
-            period_id: 1,
-            match_time_secs: time,
-            team_id: team.into(),
-            player_id: player.into(),
-            player_name: player.into(),
-            origin_x: x,
-            origin_y: y,
-            target_x: Some(x + 20.0),
-            target_y: Some(y),
-            outcome: true,
-            is_aerial: aerial,
-            is_own_goal: false,
-        }
+        let mut ev = NormalizedEvent::test(id, 1, time, team, player, x, y);
+        ev.target_x = Some(x + 20.0);
+        ev.target_y = Some(y);
+        ev.is_aerial = aerial;
+        ev
     }
 
     fn typed_event(
@@ -1991,22 +2976,10 @@ mod engine_tests {
         x: f32,
         y: f32,
     ) -> NormalizedEvent {
-        NormalizedEvent {
-            id,
-            type_id,
-            period_id: 1,
-            match_time_secs: time,
-            team_id: team.into(),
-            player_id: String::new(),
-            player_name: String::new(),
-            origin_x: x,
-            origin_y: y,
-            target_x: None,
-            target_y: None,
-            outcome: true,
-            is_aerial: false,
-            is_own_goal: false,
-        }
+        let mut ev = NormalizedEvent::test(id, type_id, time, team, "", x, y);
+        ev.player_id = String::new();
+        ev.player_name = String::new();
+        ev
     }
 
     fn shot_event(
@@ -2044,6 +3017,133 @@ mod engine_tests {
             event(3, 6.0, "home", "h_9", 20.0, -10.0, false),
         ];
         ctx
+    }
+
+    #[test]
+    fn test_engine_assigns_every_outfielder_a_duty() {
+        let e = SimulationEngine::new(context());
+        assert_eq!(
+            e.agents.iter().filter(|a| a.duty == Duty::Goalkeeper).count(),
+            2
+        );
+        assert!(
+            e.agents
+                .iter()
+                .filter(|a| !a.is_goalkeeper)
+                .all(|a| a.duty != Duty::Unknown),
+            "an outfielder was left without a job: {:?}",
+            e.agents.iter().map(|a| (a.id.as_str(), a.duty)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_substitute_with_unknown_category_keeps_the_slot_role() {
+        let mut ctx = context();
+        ctx.lineups.get_mut("home").unwrap().push(LineupPlayer {
+            player_id: "h_12".into(),
+            position_category: 5, // the feed labels every bench player 5
+            shirt_number: 12,
+            formation_slot: 12,
+        });
+        let mut e = SimulationEngine::new(ctx);
+        let old_anchor = e.anchor_buffer.get("h_3").copied().unwrap();
+        assert_eq!(
+            e.agents[e.agent_index("h_3").unwrap()].role,
+            PlayerRole::Defender
+        );
+
+        e.reidentify("h_3", "h_12");
+
+        let idx = e.agent_index("h_12").expect("substitute has an agent");
+        assert_eq!(
+            e.agents[idx].role,
+            PlayerRole::Defender,
+            "a category-5 bench player must inherit the slot role, not become Unknown"
+        );
+        assert_eq!(e.anchor_buffer.get("h_12").copied().unwrap(), old_anchor);
+
+        // The next shape rebuild must keep him on the back line, not move him
+        // to the forward line because his nominal category was Unknown.
+        e.set_piece = None;
+        e.update_anchors();
+        let anchors = e.anchors();
+        let sub_x = anchors.get("h_12").copied().unwrap().x;
+        let defender_x = anchors.get("h_4").copied().unwrap().x;
+        assert!(
+            (sub_x - defender_x).abs() < 2.0,
+            "substitute left the back line: {sub_x:.1} vs {defender_x:.1}"
+        );
+    }
+
+    #[test]
+    fn test_phase_machine_needs_dwell_before_changing() {
+        let mut e = SimulationEngine::new(context());
+        e.sim_time = 10.0;
+        e.possession = Some(e.home_team_id.clone());
+        e.ball.position = Vector2::new(-20.0, 0.0);
+        let settled = &mut e.phases[0];
+        settled.phase = TeamPhase::BuildUp;
+        settled.candidate = TeamPhase::BuildUp;
+        settled.last_in_possession = true;
+        settled.changed_at = 0.0; // no longer a fresh turnover
+
+        e.update_phases(1.0 / 60.0);
+        assert_eq!(e.phases[0].phase, TeamPhase::BuildUp);
+
+        // The ball crosses the build-up threshold, but 0.33 s is less than the
+        // 0.45 s dwell, so the visible phase must not flicker yet.
+        e.ball.position = Vector2::new(0.0, 0.0);
+        for _ in 0..20 {
+            e.update_phases(1.0 / 60.0);
+        }
+        assert_eq!(e.phases[0].phase, TeamPhase::BuildUp);
+
+        for _ in 0..8 {
+            e.update_phases(1.0 / 60.0);
+        }
+        assert_eq!(e.phases[0].phase, TeamPhase::Progression);
+    }
+
+    #[test]
+    fn test_possession_change_triggers_fast_transition_phase() {
+        let mut e = SimulationEngine::new(context());
+        e.sim_time = 10.0;
+        e.ball.position = Vector2::new(0.0, 0.0);
+        e.possession = Some(e.home_team_id.clone());
+        let state = &mut e.phases[0];
+        state.phase = TeamPhase::MidBlock;
+        state.candidate = TeamPhase::MidBlock;
+        state.last_in_possession = false; // a turnover this tick
+        state.changed_at = 10.0;
+
+        for _ in 0..12 {
+            e.update_phases(1.0 / 60.0);
+        }
+        assert_eq!(e.phases[0].phase, TeamPhase::AttackingTransition);
+    }
+
+    #[test]
+    fn test_out_of_possession_phases_follow_ball_height() {
+        let probe = |x: f32| {
+            let mut e = SimulationEngine::new(context());
+            e.sim_time = 10.0;
+            // Home is defending; the away side has the ball.
+            e.possession = Some(e.away_team_id.clone());
+            e.ball.position = Vector2::new(x, 0.0);
+            let state = &mut e.phases[0];
+            state.phase = TeamPhase::MidBlock;
+            state.candidate = TeamPhase::MidBlock;
+            state.last_in_possession = false;
+            state.changed_at = 0.0;
+            for _ in 0..40 {
+                e.update_phases(1.0 / 60.0);
+            }
+            e.phases[0].phase
+        };
+
+        assert_eq!(probe(-25.0), TeamPhase::LowBlock);
+        assert_eq!(probe(0.0), TeamPhase::MidBlock);
+        assert_eq!(probe(15.0), TeamPhase::HighPress);
     }
 
     #[test]
@@ -2315,6 +3415,160 @@ mod engine_tests {
     }
 
     #[test]
+    fn test_saved_shot_never_crosses_the_line() {
+        // Attempt Saved with feed truth: goal-mouth (on target) + diving
+        // keeper who parries. The ball must enter the box but stop short of
+        // the line — a saved shot visually scoring is a credibility bug.
+        let mut ctx = context();
+        let mut shot = shot_event(1, 1.0, 15, "home", "h_10", 40.0, 0.0);
+        shot.goalmouth = Some((50.0, 10.0));
+        shot.keeper_xy = Some((99.0, 52.0));
+        shot.keeper_action = crate::parser::KeeperAction::Diving;
+        ctx.events = vec![shot];
+        let mut e = SimulationEngine::new(ctx);
+        let mut max_x = f32::MIN;
+        let mut min_goal_dist = f32::MAX;
+        for _ in 0..(8 * 60) {
+            e.step();
+            max_x = max_x.max(e.ball.position.x);
+            // Distance from the ball to the goal line segment.
+            if e.ball.position.x > 40.0 {
+                min_goal_dist = min_goal_dist.min(
+                    (52.5 - e.ball.position.x).abs() + e.ball.position.y.abs().max(0.0) * 0.0,
+                );
+            }
+        }
+        assert!(
+            max_x < 52.5,
+            "saved shot crossed the line (max x {max_x:.1})"
+        );
+        assert!(
+            max_x > 45.0,
+            "saved shot never threatened (max x {max_x:.1})"
+        );
+        let _ = min_goal_dist;
+    }
+
+    #[test]
+    fn test_collected_save_ends_in_keeper_hands() {
+        // Collected claim: the keeper holds it — the ball ends attached.
+        let mut ctx = context();
+        let mut shot = shot_event(1, 1.0, 15, "home", "h_10", 40.0, 0.0);
+        shot.goalmouth = Some((50.0, 5.0));
+        shot.keeper_xy = Some((99.0, 50.0));
+        shot.keeper_action = crate::parser::KeeperAction::Collected;
+        ctx.events = vec![shot];
+        let mut e = SimulationEngine::new(ctx);
+        e.run_for(6.0);
+        assert!(
+            e.ball.is_attached(),
+            "collected save should end in the keeper's hands, state={:?}",
+            e.ball.state.label()
+        );
+    }
+
+    #[test]
+    fn test_goal_uses_recorded_goalmouth_spot() {
+        // Goal with feed truth at (y102=45.8 → lateral ≈ -2.86 m): the ball
+        // must finish inside the posts near that spot, not at a hash spot.
+        let mut ctx = context();
+        let mut goal = shot_event(1, 1.0, 16, "home", "h_10", 45.0, 0.0);
+        goal.goalmouth = Some((45.8, 2.5));
+        ctx.events = vec![goal];
+        let mut e = SimulationEngine::new(ctx);
+        let mut max_x: f32 = f32::MIN;
+        let mut at_line_y = 0.0;
+        for _ in 0..(6 * 60) {
+            e.step();
+            if e.ball.position.x > max_x {
+                max_x = e.ball.position.x;
+                at_line_y = e.ball.position.y;
+            }
+        }
+        assert_eq!(e.score, [1, 0]);
+        assert!(max_x > 49.0, "goal never reached the net ({max_x:.1})");
+        assert!(
+            (at_line_y - (-2.86)).abs() < 1.0,
+            "goal should finish near the recorded spot, y={at_line_y:.2}"
+        );
+    }
+
+    #[test]
+    fn test_failed_pass_names_no_receiver() {
+        // An incomplete pass followed by an opponent interception: nobody on
+        // the passing team may be routed onto it, and the emitted action
+        // carries no receiver.
+        let mut ctx = context();
+        let mut failed = event(1, 2.0, "home", "h_6", -10.0, 0.0, false);
+        failed.target_x = Some(15.0);
+        failed.target_y = Some(0.0);
+        failed.outcome = false;
+        failed.outcome_reason = crate::parser::OutcomeReason::Intercepted;
+        let mut pick = event(2, 2.8, "away", "a_4", 12.0, 1.0, false);
+        pick.type_id = 8;
+        pick.target_x = None;
+        pick.target_y = None;
+        ctx.events = vec![failed, pick];
+        let mut e = SimulationEngine::new(ctx);
+        // Run past the pass (slip may hold it up to 2 s while the doer
+        // arrives) and check every tick: no home outfielder may hold a
+        // receiver task for the failed pass.
+        let mut fired = None;
+        for _ in 0..(8 * 60) {
+            e.step();
+            for a in e.agents.iter() {
+                if a.team_id == "home" && !a.is_goalkeeper {
+                    assert!(
+                        a.receiver_task.is_none(),
+                        "teammate routed onto a failed pass: {}",
+                        a.id
+                    );
+                }
+            }
+            if let Some(a) = e.last_actions.iter().find(|a| a.event_id == 1) {
+                fired = Some(a.receiver_id.clone());
+            }
+        }
+        assert_eq!(
+            fired,
+            Some(None),
+            "failed pass must fire and name no receiver"
+        );
+    }
+
+    #[test]
+    fn test_curved_cross_rejoins_the_lane() {
+        // In-swinging corner: the ball swings wide mid-flight and still lands
+        // on the target — curve is theatre, not error.
+        use crate::ball::Ball;
+        use crate::formation::Vector2;
+        use crate::parser::PassKind;
+        let mut b = Ball::new(Vector2::new(-40.0, -20.0));
+        b.launch_for_kind(Vector2::new(40.0, 0.0), PassKind::CornerTaken, 2.5, true);
+        let mut max_dev = 0.0f32;
+        let none: std::collections::HashMap<String, (Vector2, f32)> =
+            std::collections::HashMap::new();
+        for _ in 0..600 {
+            b.update(1.0 / 60.0, |id| none.get(id).copied());
+            if b.is_in_flight() {
+                // Deviation from the straight lane.
+                let lane = Vector2::new(80.0, 20.0);
+                let rel = b.position - Vector2::new(-40.0, -20.0);
+                let dev = (rel.x * lane.y - rel.y * lane.x).abs() / lane.length();
+                max_dev = max_dev.max(dev);
+            } else {
+                break;
+            }
+        }
+        assert!(max_dev > 0.5, "no curve visible (max dev {max_dev:.2})");
+        assert!(
+            b.position.distance(Vector2::new(40.0, 0.0)) < 0.1,
+            "curve must rejoin the lane, landed at {:?}",
+            b.position
+        );
+    }
+
+    #[test]
     fn test_offside_line_is_finite_and_on_pitch() {
         let mut e = SimulationEngine::new(context());
         e.run_for(3.0);
@@ -2387,6 +3641,110 @@ mod engine_tests {
         {
             assert!(a.position.x < 30.0, "home defender chased to x={:.1}", a.position.x);
         }
+    }
+
+    #[test]
+    fn test_formation_change_retunes_shape_mid_match() {
+        // A type-40 row at t=30 switches away to a back three: their duty mix
+        // must change without anyone teleporting.
+        use crate::parser::FormationChange;
+        let mut ctx = context();
+        let xi: Vec<LineupPlayer> = (1..=11)
+            .map(|slot| LineupPlayer {
+                player_id: format!("a_{slot}"),
+                position_category: match slot {
+                    1 => 1,
+                    2..=6 => 2,
+                    7..=9 => 3,
+                    _ => 4,
+                },
+                shirt_number: slot,
+                formation_slot: slot,
+            })
+            .collect();
+        ctx.formation_changes.push(FormationChange {
+            match_time_secs: 30.0,
+            period_id: 1,
+            team_id: "away".into(),
+            lineup: xi,
+        });
+        let mut e = SimulationEngine::new(ctx);
+        let before: Vec<_> = e
+            .agents
+            .iter()
+            .filter(|a| a.team_id == "away")
+            .map(|a| (a.id.clone(), a.duty))
+            .collect();
+        let mut max_step = 0.0f32;
+        let mut prev: Vec<_> = e.agents.iter().map(|a| a.position).collect();
+        e.run_for(40.0);
+        for (i, a) in e.agents.iter().enumerate() {
+            max_step = max_step.max(prev[i].distance(a.position) / 1.0);
+            prev[i] = a.position;
+        }
+        let after: Vec<_> = e
+            .agents
+            .iter()
+            .filter(|a| a.team_id == "away")
+            .map(|a| (a.id.clone(), a.duty))
+            .collect();
+        assert_ne!(before, after, "formation change did not retune duties");
+        assert!(
+            after.iter().filter(|(_, d)| *d == Duty::CentreBack).count() >= 3,
+            "back three not applied: {after:?}"
+        );
+        let _ = max_step;
+    }
+
+    #[test]
+    fn test_red_card_parks_player_and_plays_short_handed() {
+        // Straight red: the player walks off (sent_off) and takes no further
+        // part; the side keeps 10 active bodies.
+        let mut ctx = context();
+        let mut card = typed_event(1, 2.0, 17, "away", 0.0, 0.0);
+        card.player_id = "a_4".into();
+        card.player_name = "a_4".into();
+        card.card = crate::parser::CardKind::Red;
+        ctx.events = vec![card];
+        let mut e = SimulationEngine::new(ctx);
+        // The doer may need the slip budget to reach the spot, then the
+        // 36 m walk to the touchline at jog pace.
+        e.run_for(20.0);
+        let idx = e.agent_index("a_4").expect("dismissed agent kept");
+        assert!(e.agents[idx].sent_off, "red-carded player not flagged");
+        assert!(
+            e.agents[idx].position.y.abs() > 34.0 - 0.6,
+            "dismissed player did not walk off: {:?}",
+            e.agents[idx].position
+        );
+        let active = e
+            .agents
+            .iter()
+            .filter(|a| a.team_id == "away" && !a.sent_off)
+            .count();
+        assert_eq!(active, 10, "side not short-handed: {active} active");
+    }
+
+    #[test]
+    fn test_possession_follows_last_touch() {
+        // After a completed home pass, possession is home — not merely the
+        // next event's team.
+        let mut ctx = context();
+        let mut p1 = event(1, 1.0, "home", "h_6", -10.0, 0.0, false);
+        p1.target_x = Some(10.0);
+        p1.target_y = Some(0.0);
+        let mut p2 = event(2, 2.0, "home", "h_9", 10.0, 0.0, false);
+        p2.target_x = Some(20.0);
+        p2.target_y = Some(0.0);
+        let away = event(3, 30.0, "away", "a_10", 0.0, 5.0, false);
+        ctx.events = vec![p1, p2, away];
+        let mut e = SimulationEngine::new(ctx);
+        e.run_for(5.0);
+        assert_eq!(
+            e.possession.as_deref(),
+            Some("home"),
+            "possession should follow the last touch"
+        );
     }
 
     #[test]
@@ -2656,6 +4014,53 @@ mod engine_tests {
     }
 
     #[test]
+    fn hostile_half_time_kickoff_is_taken_from_the_circle() {
+        // The first event after the interval belongs to the home side. A
+        // period boundary has no simulated interval, so the taker and second
+        // kicker must already be bodies inside the centre circle on the first
+        // second-half tick.
+        let mut ctx = context();
+        let mut second_half = event(4, 3.0, "home", "h_9", 0.0, 0.0, false);
+        second_half.period_id = 2;
+        ctx.events.push(second_half);
+        let mut e = SimulationEngine::new(ctx);
+
+        // Match start: the scheduled taker's body, not just his anchor.
+        let first = e.agent_index("h_6").expect("first taker");
+        assert!(
+            e.agents[first].position.length() < 9.15,
+            "match-start taker outside the centre circle: {:?}",
+            e.agents[first].position
+        );
+
+        for _ in 0..600 {
+            e.step();
+            if e.current_period == 2 {
+                break;
+            }
+        }
+        assert_eq!(e.current_period, 2, "half-time never reached");
+        assert!(
+            e.ball.position.length() < 0.6,
+            "second-half ball not on the centre spot: {:?}",
+            e.ball.position
+        );
+
+        let taker = e.agent_index("h_9").expect("second-half taker");
+        let second = e.agent_index("h_10").expect("second-half kicker");
+        assert!(
+            e.agents[taker].position.length() < 9.15,
+            "second-half taker outside the centre circle: {:?}",
+            e.agents[taker].position
+        );
+        assert!(
+            e.agents[second].position.length() < 9.15,
+            "second-half kicker outside the centre circle: {:?}",
+            e.agents[second].position
+        );
+    }
+
+    #[test]
     fn hostile_corner_boxes_are_populated() {
         let mut ctx = context();
         ctx.events = vec![typed_event(1, 1.0, 6, "home", 50.0, 20.0)];
@@ -2726,4 +4131,26 @@ mod engine_tests {
             .count();
         assert!(wall >= 3, "no free-kick wall ({wall} defenders near the ball)");
     }
+
+#[test]
+fn dbg_kickoff_spot() {
+    let mut ctx = context();
+    let mut second_half = event(4, 3.0, "home", "h_9", 0.0, 0.0, false);
+    second_half.period_id = 2;
+    ctx.events.push(second_half);
+    for e in &ctx.events { println!("ev id={} p={} t={:.2} type={}", e.id, e.period_id, e.match_time_secs, e.type_id); }
+    let mut e = SimulationEngine::new(ctx);
+    for i in 0..600 {
+        e.step();
+        if e.current_period == 2 {
+            println!("period2 at tick {i} sim={:.2} ball={:?} pending_kickoff={:?}", e.sim_time, e.ball.position, e.pending_kickoff.is_some());
+            break;
+        }
+    }
+    println!("final ball={:?} set_piece={:?}", e.ball.position, e.set_piece_active());
+}
+
+
+
+
 }

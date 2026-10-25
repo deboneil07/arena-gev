@@ -50,6 +50,19 @@ for (let i = 0; i < 23; i++) assert.ok(buf[i * 6 + 2] >= 0, 'negative altitude')
 assert.ok(engine.get_sim_time() >= 4.9, 'sim clock did not advance');
 console.log(`✓ ticked 5 s (clock ${engine.get_sim_time().toFixed(2)} s, ${home}+${away}+1 entities)`);
 
+// ── Tactical metadata exposed for the analysis overlays ────────
+const roles = Array.from({ length: 22 }, (_, i) => engine.get_player_role(i));
+assert.ok(roles.every((r) => Number.isInteger(r) && r >= 0 && r <= 4), 'invalid player role');
+assert.strictEqual(roles.filter((r) => r === 1).length, 2, 'expected two goalkeepers');
+assert.ok(roles.filter((r) => r === 3).length >= 2, 'expected midfielders');
+for (let i = 0; i < 22; i++) {
+  const speed = engine.get_player_speed(i);
+  assert.ok(Number.isFinite(speed) && speed >= 0, `invalid speed at player ${i}`);
+}
+assert.ok([-1, 0, 1].includes(engine.get_possession_team()), 'invalid possession team');
+assert.strictEqual(typeof engine.get_set_piece_active(), 'boolean');
+console.log('✓ tactical metadata (roles, speed, possession, set piece) is valid');
+
 // ── Full match: performance + consistency ──────────────────────
 const t0 = Date.now();
 let maxAlt = 0;

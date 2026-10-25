@@ -13,8 +13,12 @@
 //! * **InFlight** integrates a quadratic ease-out horizontally
 //!   (`u_drag = 2u − u²`, aerodynamic drag) and a parabolic arc vertically
 //!   (`z = 4·h·u·(1−u)`), so the God's-eye view can render drop shadows and
-//!   scale changes for crosses, lofted through-balls and clearances.
-//! * **Loose** rolls with exponential-ish friction until it stops.
+//!   scale changes for crosses, lofted through-balls and clearances. Curved
+//!   deliveries (in/out-swingers) add a lateral sine offset that peaks
+//!   mid-flight and rejoins the lane at landing.
+//! * **Loose** rolls with friction until it stops; the landing residual
+//!   (pace + friction) is configurable per kick — a parry skids wide, a
+//!   through-ball keeps rolling, a staged ball stops dead.
 //!
 //! Everything is deterministic and allocation-free during [`Ball::update`].
 
@@ -40,6 +44,61 @@ pub const REST_SPEED: f32 = 0.05;
 /// Bounded so an attach never reads as a teleport.
 pub const CLOSE_TO_FEET_SPEED: f32 = 6.0;
 
+// ── Pass-kind flight model ─────────────────────────────────────────
+//
+// Derived from the feed's own qualifiers (Q1/2/4/5/6/107/124/152/156/157/196/
+// 198/223/224/237/241/279): each delivery gets a realistic speed band and an
+// aerial flag instead of one global 19/20 m/s. `launch_for_kind` picks the
+// band midpoint; flight time is distance/speed, never stretched to fit a
+// receiver — the receiver is routed to the landing point instead.
+
+use crate::parser::PassKind;
+
+/// Launch speed (m/s) for a pass kind.
+#[inline]
+pub fn pass_speed(kind: PassKind) -> f32 {
+    match kind {
+        PassKind::Ground => 20.0,
+        PassKind::Cross => 21.0,
+        PassKind::ThroughBall => 21.0,
+        PassKind::LongBall => 22.0,
+        PassKind::Switch => 22.0,
+        PassKind::Cutback => 17.0,
+        PassKind::Layoff => 15.0,
+        PassKind::Launch => 21.0,
+        PassKind::Throw => 12.0,
+        PassKind::CornerTaken => 17.0,
+        PassKind::FreeKickTaken => 19.0,
+        PassKind::GoalKick => 20.0,
+        PassKind::KickoffStart | PassKind::KickoffRestart => 12.0,
+        PassKind::KeeperHoof => 22.0,
+        PassKind::Unknown => GROUND_PASS_SPEED,
+    }
+}
+
+/// Whether a pass kind is normally airborne.
+#[inline]
+pub fn pass_is_aerial(kind: PassKind, dist: f32) -> bool {
+    match kind {
+        PassKind::Cross | PassKind::LongBall | PassKind::Switch | PassKind::Launch
+        | PassKind::CornerTaken | PassKind::GoalKick | PassKind::KeeperHoof => true,
+        PassKind::Cutback | PassKind::Layoff | PassKind::Throw | PassKind::KickoffStart
+        | PassKind::KickoffRestart => false,
+        _ => dist > AUTO_AERIAL_DISTANCE,
+    }
+}
+
+/// Peak height (m) for an aerial delivery of this kind and distance.
+#[inline]
+pub fn pass_apex(kind: PassKind, dist: f32) -> f32 {
+    let base = match kind {
+        PassKind::Cross | PassKind::CornerTaken => dist * 0.14,
+        PassKind::LongBall | PassKind::Switch | PassKind::Launch => dist * 0.10,
+        _ => dist * 0.12,
+    };
+    base.clamp(1.0, 6.5)
+}
+
 // ── Types ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,6 +107,10 @@ pub enum BallFlightType {
     Ground,
     /// Parabolic arc peaking at `max_height` metres.
     Aerial { max_height: f32 },
+    /// Curved delivery: aerial arc plus a lateral sine bend peaking at
+    /// `bend` metres mid-flight (in/out-swingers, bending through-balls).
+    /// Rejoins the lane exactly at landing.
+    Curved { max_height: f32, bend: f32 },
     /// Ground reposition toward a *future event spot*: constant speed (no
     /// drag ease) so the arrival can be timed exactly, and a dead stop on
     /// landing — it has to be resting on that spot, not roll past it.
@@ -61,6 +124,7 @@ impl BallFlightType {
         match self {
             BallFlightType::Ground => "Ground",
             BallFlightType::Aerial { .. } => "Aerial",
+            BallFlightType::Curved { .. } => "Curved",
             BallFlightType::Reposition => "Reposition",
         }
     }
@@ -74,6 +138,9 @@ pub enum BallState {
     InFlight {
         start_pos: Vector2,
         target_pos: Vector2,
+        /// Lateral curve vector (perp × bend): added as `sin(π·u)`, so it
+        /// peaks mid-flight and rejoins the lane exactly at landing.
+        curve: Vector2,
         total_time: f32,
         elapsed_time: f32,
         flight_type: BallFlightType,
@@ -100,6 +167,14 @@ pub struct Ball {
     /// Height off the ground (z-axis, metres).
     pub altitude: f32,
     pub state: BallState,
+    /// Landing residual for the *current* flight: `(roll speed m/s, friction
+    /// m/s²)` applied on touchdown. A parry skids wide, a through-ball keeps
+    /// rolling, a normal pass rolls out gently.
+    landing_roll: (f32, f32),
+    /// Landing deflection for the *current* flight: an explicit post-landing
+    /// velocity `(direction, speed m/s, friction m/s²)`. A parried save lands
+    /// on target and skids back out wide instead of rolling over the line.
+    landing_deflect: Option<(Vector2, f32, f32)>,
 }
 
 impl Ball {
@@ -112,7 +187,28 @@ impl Ball {
                 velocity: Vector2::zero(),
                 friction: LOOSE_FRICTION,
             },
+            landing_roll: (LANDING_RESIDUAL_SPEED, LOOSE_FRICTION),
+            landing_deflect: None,
         }
+    }
+
+    /// Set the touchdown residual for the next landing: `roll` m/s along the
+    /// flight direction, decaying at `friction` m/s². Call after `launch`.
+    #[inline]
+    pub fn set_landing_roll(&mut self, roll: f32, friction: f32) {
+        self.landing_roll = (roll.max(0.0), friction.max(0.5));
+        self.landing_deflect = None;
+    }
+
+    /// Set an explicit post-landing velocity for the next touchdown:
+    /// `dir` × `speed` m/s decaying at `friction` m/s². Overrides the
+    /// along-flight residual (parries skid sideways, not into the net).
+    #[inline]
+    pub fn set_landing_deflect(&mut self, dir: Vector2, speed: f32, friction: f32) {
+        if dir.length_sq() > 1e-6 {
+            self.landing_deflect = Some((dir.normalize(), speed.max(0.0), friction.max(0.5)));
+        }
+        self.landing_roll = (0.0, friction.max(0.5));
     }
 
     /// True while the ball is travelling between two points.
@@ -217,6 +313,68 @@ impl Ball {
         self.begin_flight(target, duration, BallFlightType::Reposition);
     }
 
+    /// Launch the ball toward `target` for a pass of `kind`, deriving the
+    /// flight time, height and curve from the feed's own qualifiers.
+    /// Flight time is distance/speed — never stretched to fit a receiver.
+    /// `forced_aerial` honours an explicit aerial flag (chipped qualifier or
+    /// aerial duel) even when the kind would stay on the ground.
+    pub fn launch_for_kind(
+        &mut self,
+        target: Vector2,
+        kind: PassKind,
+        bend: f32,
+        forced_aerial: bool,
+    ) {
+        let target = target.clamp_on_pitch();
+        let dist = self.position.distance(target);
+        let speed = pass_speed(kind).max(1.0);
+        let total_time = (dist / speed).max(MIN_FLIGHT_TIME);
+        let flight_type = if forced_aerial || pass_is_aerial(kind, dist) {
+            let h = pass_apex(kind, dist);
+            if bend.abs() > 0.05 {
+                BallFlightType::Curved {
+                    max_height: h,
+                    bend,
+                }
+            } else {
+                BallFlightType::Aerial { max_height: h }
+            }
+        } else {
+            BallFlightType::Ground
+        };
+        self.begin_flight(target, total_time, flight_type);
+    }
+
+    /// Like [`Ball::launch_for_kind`] with an explicit flight duration —
+    /// used for the WS1 coordination budget (extend, never shorten).
+    pub fn launch_for_kind_with_duration(
+        &mut self,
+        target: Vector2,
+        kind: PassKind,
+        bend: f32,
+        forced_aerial: bool,
+        duration: f32,
+    ) {
+        let target = target.clamp_on_pitch();
+        let dist = self.position.distance(target);
+        let natural = (dist / pass_speed(kind).max(1.0)).max(MIN_FLIGHT_TIME);
+        let total_time = duration.max(natural).max(MIN_FLIGHT_TIME);
+        let flight_type = if forced_aerial || pass_is_aerial(kind, dist) {
+            let h = pass_apex(kind, dist);
+            if bend.abs() > 0.05 {
+                BallFlightType::Curved {
+                    max_height: h,
+                    bend,
+                }
+            } else {
+                BallFlightType::Aerial { max_height: h }
+            }
+        } else {
+            BallFlightType::Ground
+        };
+        self.begin_flight(target, total_time, flight_type);
+    }
+
     /// Launch the ball toward `target`, deriving the flight time from the
     /// distance and an event-appropriate speed.
     pub fn launch(&mut self, target: Vector2, is_aerial: bool, is_shot: bool) {
@@ -264,14 +422,30 @@ impl Ball {
     fn begin_flight(&mut self, target: Vector2, total_time: f32, flight_type: BallFlightType) {
         let start = self.position.clamp_on_pitch();
         let target = target.clamp_on_pitch();
+        // Curve vector: perpendicular to the lane × bend, applied as sin(πu).
+        // Zero for straight flights (cheap branch in `update`).
+        let bend = match flight_type {
+            BallFlightType::Curved { bend, .. } => bend,
+            _ => 0.0,
+        };
+        let lane = target - start;
+        let curve = if bend.abs() > 1e-6 && lane.length_sq() > 1e-6 {
+            let perp = Vector2::new(-lane.y, lane.x).normalize();
+            perp * bend
+        } else {
+            Vector2::zero()
+        };
         self.position = start;
         self.altitude = 0.0;
+        self.landing_roll = (LANDING_RESIDUAL_SPEED, LOOSE_FRICTION);
+        self.landing_deflect = None;
         // Callers floor the duration themselves (`natural_flight_time`,
         // `launch_with_duration`, `travel_to`); a blanket floor here would
         // silently break staged arrivals, which must land on the exact tick.
         self.state = BallState::InFlight {
             start_pos: start,
             target_pos: target,
+            curve,
             total_time,
             elapsed_time: 0.0,
             flight_type,
@@ -316,6 +490,7 @@ impl Ball {
             BallState::InFlight {
                 start_pos,
                 target_pos,
+                curve,
                 total_time,
                 elapsed_time,
                 flight_type,
@@ -330,31 +505,53 @@ impl Ball {
                     _ => 2.0 * u - u * u,
                 };
                 self.position = start_pos + (target_pos - start_pos) * u_h;
+                // Curved deliveries swing wide mid-flight and rejoin the lane.
+                if curve.length_sq() > 1e-8 {
+                    self.position = self.position + curve * (std::f32::consts::PI * u).sin();
+                }
 
                 // Vertical parabola (0 at both ends, `h` at u = 0.5).
                 self.altitude = match flight_type {
                     BallFlightType::Ground => 0.0,
-                    BallFlightType::Aerial { max_height } => 4.0 * max_height * u * (1.0 - u),
+                    BallFlightType::Aerial { max_height } => {
+                        4.0 * max_height * u * (1.0 - u)
+                    }
+                    BallFlightType::Curved { max_height, .. } => {
+                        4.0 * max_height * u * (1.0 - u)
+                    }
                     BallFlightType::Reposition => 0.0,
                 };
 
                 if u >= 1.0 {
-                    // Landed at the destination: a staged ball stops dead on
-                    // the spot, a kicked one rolls on with residual pace.
+                    // Landed at the destination: apply this flight's residual —
+                    // a staged ball stops dead, a deflected parry skids on an
+                    // explicit vector, anything else rolls out gently.
                     self.position = target_pos;
                     self.altitude = 0.0;
-                    let velocity = match flight_type {
-                        BallFlightType::Reposition => Vector2::zero(),
-                        _ => (target_pos - start_pos).normalize() * LANDING_RESIDUAL_SPEED,
+                    let (velocity, friction) = match self.landing_deflect {
+                        Some((dir, speed, fr)) => (dir * speed, fr),
+                        None => {
+                            let (roll, fr) = match flight_type {
+                                BallFlightType::Reposition => (0.0, LOOSE_FRICTION),
+                                _ => self.landing_roll,
+                            };
+                            let velocity = if roll > 1e-3 {
+                                (target_pos - start_pos).normalize() * roll
+                            } else {
+                                Vector2::zero()
+                            };
+                            (velocity, fr)
+                        }
                     };
                     self.state = BallState::Loose {
                         velocity,
-                        friction: LOOSE_FRICTION,
+                        friction,
                     };
                 } else {
                     self.state = BallState::InFlight {
                         start_pos,
                         target_pos,
+                        curve,
                         total_time,
                         elapsed_time: next_elapsed,
                         flight_type,

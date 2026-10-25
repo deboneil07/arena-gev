@@ -165,3 +165,4 @@ fn test_engine_run_to_end_is_consistent() {
     assert!(e.is_consistent());
     assert!(e.dispatcher.is_finished());
 }
+

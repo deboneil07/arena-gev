@@ -26,8 +26,13 @@
 
 use crate::ball_spot_expected;
 use crate::agent::{AgentState, PlayerAgent, PlayerRole};
+use crate::event_graph::{resolve_pass, PassResolution};
 use crate::formation::Vector2;
-use crate::parser::{NormalizedEvent, EVENT_TYPE_PLAYER_OFF, EVENT_TYPE_PLAYER_ON};
+use crate::parser::{
+    is_ball_event, BodyPart, CardKind, KeeperAction, NormalizedEvent, OutcomeReason, PassKind,
+    SetPieceTag, EVENT_TYPE_PLAYER_OFF, EVENT_TYPE_PLAYER_ON,
+};
+use crate::tactics::{EventCue, LookaheadBlock};
 use std::collections::HashMap;
 
 /// Extra settle time added to the kinematic travel time so a player arrives
@@ -42,10 +47,16 @@ pub const DOER_READY_TOL: f32 = 1.5;
 /// next event's doer — he must finish at his origin, not drift past it.
 pub const DOER_READY_TOL_RECEIVER: f32 = 1.0;
 /// How close the ball must be to the origin of an event that plays it.
-pub const BALL_READY_TOL: f32 = 1.0;
+/// Tighter than the doer tolerance: a ball a metre off reads as a misplaced
+/// action, and the slip budget (2 s) absorbs the extra wait.
+pub const BALL_READY_TOL: f32 = 0.8;
 /// The most a due event may be held back waiting for its actors. Beyond it
 /// the event fires anyway — a wrong-position beat beats a stalled timeline.
 pub const SLIP_MAX_SECS: f32 = 2.0;
+/// Tighter budget while a dead-ball restart is armed: a restart must never
+/// visibly park over the ball. The taker is positioned in advance, so this is
+/// only a safety net.
+pub const RESTART_SLIP_MAX_SECS: f32 = 0.9;
 
 /// Settle buffer for the intended receiver of a pass.
 pub const RECEIVER_BUFFER_SECS: f32 = 0.30;
@@ -70,10 +81,13 @@ pub struct DispatchedAction {
     pub team_id: String,
     pub player_id: String,
     pub origin: Vector2,
-    /// The Opta timestamp of the event (mm:ss of the feed), which can lead
-    /// the simulation clock when dispatch had to wait for an actor/ball to
-    /// get into place. The UI renders *this*, not `sim_time`.
+    /// The Opta timestamp of the event (sim clock, chronological across
+    /// periods), which can lead the simulation clock when dispatch had to
+    /// wait for an actor/ball to get into place.
     pub feed_time: f32,
+    /// Display clock (raw min*60+sec within the period) for mm:ss UI rows.
+    /// Never offset — P2 45:00 displays as 45:00.
+    pub display_time: f32,
     /// The doer's tactical state *before* `begin_action` put him into the
     /// action pose — diagnostic for accuracy measurements.
     pub doer_state: Option<&'static str>,
@@ -82,6 +96,7 @@ pub struct DispatchedAction {
     pub doer_stage_target: Option<Vector2>,
     pub target: Option<Vector2>,
     /// Intended receiver of this pass (if one could be identified).
+    /// `None` for failed passes: nobody is routed onto an interception.
     pub receiver_id: Option<String>,
     pub outcome: bool,
     pub is_aerial: bool,
@@ -89,6 +104,29 @@ pub struct DispatchedAction {
     /// The engine credits the opponent and flies the ball into the scorer's
     /// own goal.
     pub is_own_goal: bool,
+    // ── WS1: whole-event semantics (decided by the event graph) ──
+    /// How the pass was played (pass rows).
+    pub pass_kind: PassKind,
+    /// Why the action succeeded / failed.
+    pub outcome_reason: OutcomeReason,
+    /// Goal-mouth target `(y102, z103)` in feed 0–100 units, when known.
+    pub goalmouth: Option<(f32, f32)>,
+    /// Keeper position `(x230, y231)` for the shot, feed 0–100 units.
+    pub keeper_xy: Option<(f32, f32)>,
+    /// Keeper position at goal time `(Q395, Q396)` for goals.
+    pub keeper_at_goal: Option<(f32, f32)>,
+    /// How the keeper dealt with it (parried / collected / diving …).
+    pub keeper_action: KeeperAction,
+    /// Body part used.
+    pub body_part: BodyPart,
+    /// Measured ball travel, metres (Q212).
+    pub length_m: Option<f32>,
+    /// Set-piece swing (in/out) for curved deliveries.
+    pub setpiece_swing: SetPieceTag,
+    /// Card shown on this event (cards only).
+    pub card: CardKind,
+    /// Penalty context (fouls only): the kick is a penalty.
+    pub penalty: bool,
 }
 
 /// Exact time for a point mass at rest to travel `dist` metres given a top
@@ -202,6 +240,91 @@ impl LookaheadDispatcher {
         self.cursor
     }
 
+    /// The shared event block for both teams: each side's next on-ball event,
+    /// the opponent's next event, and the landing point of the next pass.
+    ///
+    /// The scan is capped at `horizon` seconds and starts at the cursor, so it
+    /// never re-reads history or walks the whole match on every tick. Both
+    /// teams receive a block even when only one of them has a cue: an empty
+    /// `Option` is itself information (no event is coming).
+    pub fn lookahead_blocks(
+        &self,
+        home_id: &str,
+        away_id: &str,
+        now: f32,
+        horizon: f32,
+    ) -> [LookaheadBlock; 2] {
+        let mut next: [Option<EventCue>; 2] = [None, None];
+        let mut landing: [Option<EventCue>; 2] = [None, None];
+        let end = now + horizon.max(PRE_POSITION_SECS);
+
+        for event in &self.events[self.cursor..] {
+            if event.match_time_secs > end {
+                break;
+            }
+            // A due but held event is still the next thing that will happen,
+            // so keep it in the window rather than skipping behind `now`.
+            if event.match_time_secs < now - SLIP_MAX_SECS {
+                continue;
+            }
+            if event.team_id.is_empty() || !is_ball_event(event.type_id) {
+                continue;
+            }
+            let team = if event.team_id == home_id {
+                0
+            } else if event.team_id == away_id {
+                1
+            } else {
+                continue;
+            };
+            let origin = Vector2::new(event.origin_x, event.origin_y);
+            let target = match (event.target_x, event.target_y) {
+                (Some(x), Some(y)) => Some(Vector2::new(x, y)),
+                _ => None,
+            };
+            let cue = EventCue {
+                origin,
+                target,
+                time: event.match_time_secs,
+                type_id: event.type_id,
+            };
+
+            if next[team].is_none() {
+                // The landing is tied to the *next* event, not to a later
+                // pass: a shot or tackle in two seconds must not be shadowed
+                // by a cross that lands in six.
+                if let Some(spot) = target.filter(|_| cue.is_pass()) {
+                    // The ball takes a beat to arrive; the support/box target
+                    // is the landing point, not the passer's feet.
+                    let flight = ((spot - origin).length() / 20.0).max(0.35);
+                    landing[team] = Some(EventCue {
+                        time: event.match_time_secs + flight,
+                        ..cue
+                    });
+                }
+                next[team] = Some(cue);
+            }
+            if next[0].is_some() && next[1].is_some() {
+                break;
+            }
+        }
+
+        [
+            LookaheadBlock {
+                team: next[0],
+                opponent: next[1],
+                team_landing: landing[0],
+                opponent_landing: landing[1],
+            },
+            LookaheadBlock {
+                team: next[1],
+                opponent: next[0],
+                team_landing: landing[1],
+                opponent_landing: landing[0],
+            },
+        ]
+    }
+
     /// True once every event has been executed.
     #[inline]
     pub fn is_finished(&self) -> bool {
@@ -255,24 +378,29 @@ impl LookaheadDispatcher {
 
     /// Choose the intended receiver of a pass with a known landing point.
     ///
-    /// Priority: the next same-team event's player (the Opta reception), then
-    /// the best-placed teammate by role-weighted proximity to the target. This
-    /// is what stops "ghost" passes into empty space.
+    /// Outcome-aware (WS1): a failed pass has no receiver — the event graph
+    /// resolves it to the interceptor or the lane point, and routing a
+    /// team-mate onto it would fake a completion. Only completed passes name
+    /// a receiver: the Opta reception (next same-team touch) first, then the
+    /// best-placed teammate by role-weighted proximity.
     fn pick_receiver(&self, i: usize, target: Vector2, agents: &[PlayerAgent]) -> Option<String> {
         let event = &self.events[i];
-        if i + 1 < self.events.len() {
-            let next = &self.events[i + 1];
-            if next.team_id == event.team_id
-                && !next.player_id.is_empty()
-                && next.player_id != event.player_id
-                && next.match_time_secs - event.match_time_secs < 8.0
-            {
-                return Some(next.player_id.clone());
+        match resolve_pass(&self.events, i) {
+            PassResolution::Complete { receiver_idx } => {
+                return Some(self.events[receiver_idx].player_id.clone());
             }
+            PassResolution::CompleteLoose => {}
+            // Failed passes: nobody runs onto the ball.
+            PassResolution::Intercept { .. }
+            | PassResolution::InterceptPoint { .. }
+            | PassResolution::Out { .. } => return None,
         }
+        // No linked reception: best-placed teammate fallback (stops ghosts).
+        // Sent-off players are unavailable.
         let mut best: Option<(f32, &str)> = None;
         for a in agents.iter() {
-            if a.team_id != event.team_id
+            if a.sent_off
+                || a.team_id != event.team_id
                 || a.id == event.player_id
                 || a.role == PlayerRole::Goalkeeper
             {
@@ -292,8 +420,60 @@ impl LookaheadDispatcher {
         best.map(|(_, id)| id.to_string())
     }
 
+    /// Where a failed pass actually ends: the interceptor's touch, the lane
+    /// point, or the out spot — refined with live defender positions.
+    /// `event_id` locates the event; `None` for completed passes.
+    pub fn failed_endpoint(
+        &self,
+        event_id: u64,
+        agents: &[PlayerAgent],
+    ) -> Option<Vector2> {
+        let i = self.events.iter().position(|e| e.id == event_id)?;
+        self.failed_pass_endpoint(i, agents)
+    }
+
+    fn failed_pass_endpoint(&self, i: usize, agents: &[PlayerAgent]) -> Option<Vector2> {
+        let event = &self.events[i];
+        let target = match (event.target_x, event.target_y) {
+            (Some(x), Some(y)) => Vector2::new(x, y),
+            _ => return None,
+        };
+        match resolve_pass(&self.events, i) {
+            PassResolution::Intercept { by_idx } => {
+                let interceptor = &self.events[by_idx];
+                Some(Vector2::new(interceptor.origin_x, interceptor.origin_y))
+            }
+            PassResolution::InterceptPoint { point } => {
+                // Refine with the nearest live defender on the lane: project
+                // each opponent onto the segment and take the closest.
+                // Sent-off players take no part.
+                let origin = Vector2::new(event.origin_x, event.origin_y);
+                let mut best: Option<(f32, Vector2)> = None;
+                for a in agents.iter() {
+                    if a.sent_off
+                        || a.team_id == event.team_id
+                        || a.role == PlayerRole::Goalkeeper
+                    {
+                        continue;
+                    }
+                    let p = crate::event_graph::project_on_lane(a.position, origin, target);
+                    let d = a.position.distance(p);
+                    if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                        best = Some((d, p));
+                    }
+                }
+                Some(best.map(|(_, p)| p).unwrap_or(point))
+            }
+            PassResolution::Out { point } => Some(point),
+            PassResolution::Complete { .. } | PassResolution::CompleteLoose => None,
+        }
+    }
+
     /// Pre-route a receiver toward the pass landing point. Does not touch the
     /// dispatcher itself, so it can run while event borrows are live.
+    /// The task is recorded even while the player finishes their current
+    /// action — the brain picks it up the moment the action ends, so no run
+    /// is lost to a finishing touch. Only the sprint state is left alone.
     fn route_receiver(
         &self,
         idx: usize,
@@ -302,12 +482,11 @@ impl LookaheadDispatcher {
         deadline: f32,
         boost: f32,
     ) {
-        if matches!(agents[idx].state, AgentState::ExecutingAction { .. }) {
-            return;
-        }
         agents[idx].receiver_task = Some((target, deadline));
         agents[idx].sprint_boost = boost;
-        agents[idx].state = AgentState::AnticipatingEvent { target };
+        if !matches!(agents[idx].state, AgentState::ExecutingAction { .. }) {
+            agents[idx].state = AgentState::AnticipatingEvent { target };
+        }
     }
 
     /// Advance the clock by `dt`, pre-route players, and execute due events.
@@ -316,6 +495,7 @@ impl LookaheadDispatcher {
         dt: f32,
         agents: &mut [PlayerAgent],
         ball_pos: Option<Vector2>,
+        slip_max: f32,
     ) -> Vec<DispatchedAction> {
         self.sim_time += dt;
         let mut executed_actions = Vec::new();
@@ -336,8 +516,13 @@ impl LookaheadDispatcher {
             }
             let origin = Vector2::new(event.origin_x, event.origin_y);
 
-            // Primary actor: remember the soonest event only.
-            if let Some(idx) = agents.iter().position(|a| a.id == event.player_id) {
+            // Primary actor: remember the soonest event only. Sent-off
+            // players take no further part (their dismissal cleared any
+            // assignment; this also guards stale ids).
+            if let Some(idx) = agents
+                .iter()
+                .position(|a| a.id == event.player_id && !a.sent_off)
+            {
                 let sooner = soonest[idx]
                     .map(|(t, _, _)| event.match_time_secs < t)
                     .unwrap_or(true);
@@ -355,7 +540,10 @@ impl LookaheadDispatcher {
                 let flight = ((target_pos - origin).length() / 20.0).max(0.35);
                 let deadline = ev_time + flight;
                 if let Some(rid) = self.pick_receiver(i, target_pos, agents) {
-                    if let Some(idx) = agents.iter().position(|a| a.id == rid) {
+                    if let Some(idx) = agents
+                        .iter()
+                        .position(|a| a.id == rid && !a.sent_off)
+                    {
                         // A receiver who is also the *next* event's doer must
                         // end up at his own origin anyway. When that origin is
                         // within receiver tolerance of the landing point, route
@@ -451,7 +639,7 @@ impl LookaheadDispatcher {
             // origin, hold the event back — up to SLIP_MAX_SECS — so the
             // world catches up instead of staging the action in the wrong
             // place. Past the budget the event fires anyway.
-            if self.sim_time - self.events[idx].match_time_secs < SLIP_MAX_SECS
+            if self.sim_time - self.events[idx].match_time_secs < slip_max
                 && !self.event_is_ready(&self.events[idx], agents, ball_pos)
             {
                 break;
@@ -492,6 +680,7 @@ impl LookaheadDispatcher {
                 player_id: event.player_id.clone(),
                 origin,
                 feed_time: event.match_time_secs,
+                display_time: event.display_secs,
                 doer_state,
                 doer_stage_target,
                 target,
@@ -499,6 +688,17 @@ impl LookaheadDispatcher {
                 outcome: event.outcome,
                 is_aerial: event.is_aerial,
                 is_own_goal: event.is_own_goal,
+                pass_kind: event.pass_kind,
+                outcome_reason: event.outcome_reason,
+                goalmouth: event.goalmouth,
+                keeper_xy: event.keeper_xy,
+                keeper_at_goal: event.keeper_at_goal,
+                keeper_action: event.keeper_action,
+                body_part: event.body_part,
+                length_m: event.length_m,
+                setpiece_swing: event.setpiece_swing,
+                card: event.card,
+                penalty: event.penalty,
             });
 
             self.cursor += 1;
@@ -558,22 +758,7 @@ mod dispatcher_tests {
     use super::*;
 
     fn event(id: u64, time: f32, team: &str, player: &str, x: f32, y: f32) -> NormalizedEvent {
-        NormalizedEvent {
-            id,
-            type_id: 1,
-            period_id: 1,
-            match_time_secs: time,
-            team_id: team.into(),
-            player_id: player.into(),
-            player_name: player.into(),
-            origin_x: x,
-            origin_y: y,
-            target_x: None,
-            target_y: None,
-            outcome: true,
-            is_aerial: false,
-            is_own_goal: false,
-        }
+        NormalizedEvent::test(id, 1, time, team, player, x, y)
     }
 
     fn agent(id: &str, x: f32, y: f32) -> PlayerAgent {
@@ -604,7 +789,7 @@ mod dispatcher_tests {
         let dt = 1.0 / 60.0;
         let mut arrived_when_fired = None;
         for _ in 0..420 {
-            let actions = d.tick(dt, &mut agents, None);
+            let actions = d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
             agents[0].update_kinematics(dt, Vector2::new(-5.0, 0.0), &[], Vector2::zero());
             if !actions.is_empty() {
                 arrived_when_fired = Some(agents[0].position.distance(Vector2::new(20.0, 0.0)));
@@ -640,7 +825,7 @@ mod dispatcher_tests {
         let dt = 1.0 / 60.0;
         let mut anticipated_at = None;
         for tick in 0..210 {
-            d.tick(dt, &mut agents, None);
+            d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
             if anticipated_at.is_none()
                 && matches!(agents[0].state, AgentState::AnticipatingEvent { .. })
             {
@@ -667,7 +852,7 @@ mod dispatcher_tests {
         let dt = 1.0 / 60.0;
         let mut executed = false;
         for _ in 0..210 {
-            let actions = d.tick(dt, &mut agents, None);
+            let actions = d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
             agents[0].update_kinematics(dt, Vector2::new(-30.0, 0.0), &[], Vector2::zero());
             if !actions.is_empty() {
                 executed = true;
@@ -693,7 +878,7 @@ mod dispatcher_tests {
             3.5,
         );
         let mut agents = vec![agent("p", 0.0, 0.0)];
-        d.tick(1.0 / 60.0, &mut agents, None);
+        d.tick(1.0 / 60.0, &mut agents, None, SLIP_MAX_SECS);
         assert!(
             matches!(agents[0].state, AgentState::InFormation),
             "player should not anticipate an event 60s away"
@@ -714,7 +899,7 @@ mod dispatcher_tests {
         let dt = 1.0 / 60.0;
         // Run ~1s; the receiver should already be routed toward (0,0).
         for _ in 0..60 {
-            d.tick(dt, &mut agents, None);
+            d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
             for a in agents.iter_mut() {
                 a.update_kinematics(dt, a.position, &[], Vector2::zero());
             }
@@ -737,7 +922,7 @@ mod dispatcher_tests {
         let dt = 1.0 / 60.0;
         let mut prev = agents[0].position;
         for _ in 0..300 {
-            d.tick(dt, &mut agents, None);
+            d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
             agents[0].update_kinematics(dt, Vector2::zero(), &[], Vector2::zero());
             let step = prev.distance(agents[0].position);
             assert!(step <= 8.5 * dt + 1e-3, "teleport of {step} m in one tick");
@@ -756,7 +941,7 @@ mod dispatcher_tests {
         );
         let mut agents = vec![agent("p", 0.0, 0.0)];
         for _ in 0..90 {
-            d.tick(1.0 / 60.0, &mut agents, None);
+            d.tick(1.0 / 60.0, &mut agents, None, SLIP_MAX_SECS);
         }
         assert!(d.is_finished());
         assert_eq!(d.executed, 2);
@@ -778,8 +963,8 @@ mod dispatcher_tests {
         let mut aa = vec![agent("p1", 0.0, 0.0), agent("p2", 0.0, 0.0)];
         let mut bb = aa.clone();
         for _ in 0..180 {
-            a.tick(1.0 / 60.0, &mut aa, None);
-            b.tick(1.0 / 60.0, &mut bb, None);
+            a.tick(1.0 / 60.0, &mut aa, None, SLIP_MAX_SECS);
+            b.tick(1.0 / 60.0, &mut bb, None, SLIP_MAX_SECS);
         }
         for (x, y) in aa.iter().zip(bb.iter()) {
             assert_eq!(x.position, y.position);
@@ -804,7 +989,7 @@ mod dispatcher_tests {
         let mut receiver_id: Option<String> = None;
         let mut routed = false;
         for _ in 0..240 {
-            let actions = d.tick(dt, &mut agents, None);
+            let actions = d.tick(dt, &mut agents, None, SLIP_MAX_SECS);
             // The receiver may be routed via a receiver task, or promoted to the
             // primary actor of the reception event (which clears the task).
             if agents[1].receiver_task.is_some()
@@ -856,7 +1041,7 @@ mod dispatcher_tests {
         let mut agents = vec![agent("p", 1.0, 0.0)];
         let mut assigned_at = None;
         for tick in 0..(5 * 60) {
-            d.tick(1.0 / 60.0, &mut agents, None);
+            d.tick(1.0 / 60.0, &mut agents, None, SLIP_MAX_SECS);
             if assigned_at.is_none() && agents[0].assigned_event_id == Some(1) {
                 assigned_at = Some(tick as f32 / 60.0);
             }
@@ -868,6 +1053,87 @@ mod dispatcher_tests {
         assert!(
             t < 5.5,
             "event only assigned {t:.1}s before it was due (must be >=5 s early)"
+        );
+    }
+
+    #[test]
+    fn test_lookahead_blocks_serve_both_teams() {
+        let mut pass = event(1, 5.0, "home", "h1", -10.0, 0.0);
+        pass.target_x = Some(10.0);
+        pass.target_y = Some(2.0);
+        let mut away = event(2, 6.0, "away", "a1", 20.0, 5.0);
+        away.target_x = Some(30.0);
+        away.target_y = Some(5.0);
+
+        let d = LookaheadDispatcher::new(vec![pass, away], 8.0);
+        let blocks = d.lookahead_blocks("home", "away", 0.0, 8.0);
+
+        // Home sees its own pass first, with the landing a flight-time later.
+        let home_team = blocks[0].team.expect("home next event");
+        assert_eq!(home_team.origin, Vector2::new(-10.0, 0.0));
+        let home_landing = blocks[0].team_landing.expect("home landing");
+        assert_eq!(home_landing.spot(), Vector2::new(10.0, 2.0));
+        assert!(
+            home_landing.time > home_team.time,
+            "landing must be later than the pass release"
+        );
+
+        // The same block gives the opponent's next event and landing.
+        let home_opp = blocks[0].opponent.expect("home sees the away event");
+        assert_eq!(home_opp.origin, Vector2::new(20.0, 5.0));
+        let home_opp_landing = blocks[0].opponent_landing.expect("away landing");
+        assert_eq!(home_opp_landing.spot(), Vector2::new(30.0, 5.0));
+
+        // And the away block is the mirror image.
+        assert_eq!(
+            blocks[1].team.expect("away next").origin,
+            Vector2::new(20.0, 5.0)
+        );
+        assert_eq!(
+            blocks[1].opponent.expect("away sees home").origin,
+            Vector2::new(-10.0, 0.0)
+        );
+        assert_eq!(
+            blocks[1].opponent_landing.expect("home landing").spot(),
+            Vector2::new(10.0, 2.0)
+        );
+    }
+
+    #[test]
+    fn test_lookahead_block_skips_meta_events_and_respects_the_horizon() {
+        let mut d = LookaheadDispatcher::new(
+            vec![
+                event(1, 1.0, "home", "h1", 0.0, 0.0),
+                event(2, 30.0, "away", "a1", 10.0, 0.0),
+            ],
+            3.5,
+        );
+        let mut meta = event(3, 2.0, "home", "h2", 5.0, 0.0);
+        meta.type_id = 30;
+        d.events.insert(1, meta);
+        let blocks = d.lookahead_blocks("home", "away", 0.0, 3.5);
+        assert_eq!(blocks[0].team.expect("home event").origin, Vector2::zero());
+        assert!(
+            blocks[0].opponent.is_none(),
+            "a period-end event must not be treated as a ball cue"
+        );
+    }
+
+    #[test]
+    fn test_landing_cue_does_not_shadow_an_earlier_shot() {
+        let mut shot = event(1, 2.0, "home", "h1", 30.0, 0.0);
+        shot.type_id = 13;
+        let mut pass = event(2, 4.0, "home", "h2", 10.0, 0.0);
+        pass.target_x = Some(28.0);
+        pass.target_y = Some(12.0);
+
+        let d = LookaheadDispatcher::new(vec![shot, pass], 8.0);
+        let blocks = d.lookahead_blocks("home", "away", 0.0, 8.0);
+        let next = blocks[0].team.expect("home next event");
+        assert_eq!(next.type_id, 13, "the shot should be the next beat");
+        assert!(
+            blocks[0].team_landing.is_none(),
+            "a later cross must not replace the shot as the landing cue"
         );
     }
 }
