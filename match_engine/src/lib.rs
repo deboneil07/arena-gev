@@ -16,6 +16,7 @@
 //! | [`dispatcher`]| Lookahead event dispatcher (anticipation + execution) |
 //! | [`ball`]      | 3D ballistic ball trajectory & choreography |
 //! | [`engine`]    | Master 60 Hz orchestrator + render snapshots |
+//! | [`analysis_log`] | Whole-match event + roster JSON log for the analysis UI |
 //! | [`wasm`]      | WASM bridge + zero-copy flat render buffer |
 //!
 //! ## Quick start
@@ -45,6 +46,7 @@ pub mod dispatcher;
 pub mod ball;
 pub mod engine;
 pub mod simulation;
+pub mod analysis_log;
 pub mod wasm;
 
 // ── Re-exports ─────────────────────────────────────────────

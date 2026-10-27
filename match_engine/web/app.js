@@ -29,6 +29,9 @@ import { createSubstitutionTracker } from './transitions.js';
 import { createCelebrationTracker, createFxTracker } from './sequences.js';
 import { createMomentumTracker, createPassingNetwork, rowValue, seqNumber } from './graphs.js';
 import { createHeatmap } from './heatmap.js';
+import { createDribbleIndex, formatClock, zoneOf } from './dribbles.js';
+import { drawDribbleLayer } from './dribbleOverlay.js';
+import { createPlayerPanel } from './playerPanel.js';
 import { createPassingLaneTracker } from './passingLanes.js';
 import { createAttackChannelTracker } from './attackChannels.js';
 import { createMinimap } from './minimap.js';
@@ -81,6 +84,13 @@ const els = {
   awayName: document.getElementById('awayname'),
   analysisTeam: document.getElementById('analysis-team'),
   analysisTeamLabel: document.getElementById('analysis-team-label'),
+  playerContext: document.getElementById('player-context'),
+  stage: document.getElementById('stage'),
+  zoom: document.getElementById('zoom'),
+  zoomval: document.getElementById('zoomval'),
+  resetView: document.getElementById('reset-view'),
+  zoneAlpha: document.getElementById('zone-alpha'),
+  zoneAlphaVal: document.getElementById('zone-alphaval'),
 };
 
 const ctx = els.canvas.getContext('2d');
@@ -98,6 +108,46 @@ function syncEffectButtons() {
   if (els.shuffle) els.shuffle.setAttribute('aria-pressed', String(shuffleOn));
 }
 syncEffectButtons();
+
+// ── Dribble analysis: index, panel and pitch interaction state ─
+// The index is a whole-match, seek-safe snapshot built once per load; the
+// panel renders from it and reports intent (seek / selection) outward.
+let dribbleIndex = null;
+let zoneAlpha = 0.55;
+let hoveredPlayer = null; // { team, shirt } of the body under the cursor
+let hoverZone = null; // zone under the cursor while the layer is visible
+let panning = null; // { x, y, panX, panY, moved } during a drag
+
+const dribblePanel = createPlayerPanel(document.getElementById('player-panel'), {
+  /** Timeline strip: jump the sim to a dribble's match clock and pause. */
+  onSeek: (matchSecs, dribble) => {
+    seekTo(matchSecs, `Jumped to ${formatClock(dribble ? dribble.t : matchSecs)} — paused to inspect.`);
+    playing = false;
+    els.playpause.textContent = '▶ Play';
+  },
+  onSelection: (selection) => {
+    if (!selection) hidePlayerMenu();
+  },
+  onToggleZones: () => {
+    effects.setEnabled('dribbles', true);
+    syncEffectButtons();
+    setStatus('Dribble zones shown — click a zone on the pitch to filter the panel.');
+  },
+  status: setStatus,
+});
+
+/** Whole-match analysis log for the freshly loaded match (schema v1). */
+function buildDribbleIndex() {
+  dribbleIndex = null;
+  if (typeof engine?.get_analysis_json !== 'function') return;
+  try {
+    dribbleIndex = createDribbleIndex(JSON.parse(engine.get_analysis_json()));
+    dribblePanel?.setIndex(dribbleIndex, 0);
+  } catch (e) {
+    dribbleIndex = null;
+    console.warn('Dribble analysis unavailable:', e);
+  }
+}
 
 // ── World → screen ─────────────────────────────────────────────
 // Engine x ∈ [-52.5, 52.5] (home attacks +x → right).
@@ -119,6 +169,74 @@ function toScreen(x, y) {
   return [
     OFFSET_X + (x + PITCH_W_M / 2) * PX_PER_M,
     OFFSET_Y + (PITCH_H_M / 2 - y) * PX_PER_M,
+  ];
+}
+
+// ── View transform (zoom + pan) ────────────────────────────────
+// One Canvas2D transform wraps every draw call — pitch, overlays and
+// entities move together. At rest (zoom 1, pan 0) it is the identity, so
+// `toScreen` output is bit-for-bit what it was before zooming existed.
+const view = { zoom: 1, panX: 0, panY: 0 };
+const VIEW_ZOOM_MAX = 2.5;
+
+/** Apply the view transform to the pitch context (call once per frame). */
+function applyViewTransform() {
+  if (view.zoom === 1 && view.panX === 0 && view.panY === 0) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    return;
+  }
+  ctx.setTransform(
+    view.zoom, 0, 0, view.zoom,
+    CX + view.panX - CX * view.zoom,
+    CY + view.panY - CY * view.zoom,
+  );
+}
+
+/** Keep the viewport's centre over the pitch so the field stays reachable. */
+function clampView() {
+  view.zoom = Math.min(VIEW_ZOOM_MAX, Math.max(1, view.zoom));
+  if (view.zoom === 1) {
+    view.panX = 0;
+    view.panY = 0;
+    return;
+  }
+  const bx = CX - view.panX / view.zoom;
+  const by = CY - view.panY / view.zoom;
+  const mx = PITCH_PX_W * 0.15;
+  const my = PITCH_PX_H * 0.15;
+  const cx = Math.min(OFFSET_X + PITCH_PX_W + mx, Math.max(OFFSET_X - mx, bx));
+  const cy = Math.min(OFFSET_Y + PITCH_PX_H + my, Math.max(OFFSET_Y - my, by));
+  view.panX = (CX - cx) * view.zoom;
+  view.panY = (CY - cy) * view.zoom;
+}
+
+/**
+ * Canvas pixels → world metres: undo the view transform, then the base
+ * screen → world mapping. Exact inverse of `toScreen` + the view wrap.
+ */
+function fromScreen(px, py) {
+  const sx = (px - CX - view.panX) / view.zoom + CX;
+  const sy = (py - CY - view.panY) / view.zoom + CY;
+  return [
+    (sx - OFFSET_X) / PX_PER_M - PITCH_W_M / 2,
+    PITCH_H_M / 2 - (sy - OFFSET_Y) / PX_PER_M,
+  ];
+}
+
+/** Canvas pixels → base-screen pixels (undo the view transform only). */
+function toBaseScreen(px, py) {
+  return [
+    (px - CX - view.panX) / view.zoom + CX,
+    (py - CY - view.panY) / view.zoom + CY,
+  ];
+}
+
+/** Pointer client coordinates → canvas pixel coordinates (CSS-scaled). */
+function pointerToCanvas(ev) {
+  const rect = els.canvas.getBoundingClientRect();
+  return [
+    (ev.clientX - rect.left) * (els.canvas.width / rect.width),
+    (ev.clientY - rect.top) * (els.canvas.height / rect.height),
   ];
 }
 
@@ -431,6 +549,21 @@ function drawOverlays(players, possessionTeam, setPieceActive, dt, ball) {
       drawHeatmap(ctx, rect, heat[team], team, alpha);
     }
   }
+
+  // Dribble zones: a whole-match layer (static, seek-safe) drawn for the
+  // panel's current scope — the followed team by default, one player once
+  // a player is selected.
+  if (effects.isVisible('dribbles')) {
+    const stats = dribblePanel?.layerStats();
+    if (stats) {
+      drawDribbleLayer(ctx, toScreen, stats, dribblePanel.layerTeam(), {
+        alpha: zoneAlpha,
+        hoverZone,
+        selectedZone: dribblePanel.selectedZone ?? null,
+      });
+    }
+  }
+
   // Passing network: followed team, visible through the crossfade, and shown
   // until possession is lost (the streak is broken on the team switch).
   const netAlpha = Math.max(0, teamBlend);
@@ -577,6 +710,9 @@ function startEngine(xml) {
   const meta = [engine.get_competition_id(), engine.get_season(), engine.get_game_date()]
     .filter(Boolean);
   els.matchInfo.textContent = meta.length ? meta.join(' · ') : '';
+  // Fresh match → fresh whole-match dribble index; the panel resets with it.
+  hidePlayerMenu();
+  buildDribbleIndex();
   setStatus(`${engine.get_duration_secs().toFixed(0)} s of match loaded`);
   playing = true;
   els.playpause.textContent = '⏸ Pause';
@@ -761,6 +897,12 @@ async function fetchDefaultXml() {
 // ── Render ─────────────────────────────────────────────────────
 function render(dt = 0) {
   if (effects.update(dt)) syncEffectButtons();
+  // Untransformed base fill: panned margins keep the page colour instead of
+  // showing stale pixels, then the view transform carries every layer.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, els.canvas.width, els.canvas.height);
+  applyViewTransform();
   drawPitch();
   drawGoals();
   if (!engine) return;
@@ -878,6 +1020,11 @@ function render(dt = 0) {
 
   updateFollowedTeam(possessionTeam, dt);
   updateTeamChip();
+  // The zone layer and the team lens follow possession unless the analyst
+  // has pinned a player (that selection owns both the panel and the layer).
+  if (dribblePanel && dribblePanel.view !== 'player') {
+    dribblePanel.setTeam(displayTeam);
+  }
   if (typeof engine.get_sim_time === 'function') {
     sampleHeat(overlayPlayers, engine.get_sim_time());
     samplePlayerHeat(overlayPlayers, engine.get_sim_time());
@@ -1063,8 +1210,52 @@ function render(dt = 0) {
   ctx.lineWidth = 1;
   ctx.stroke();
 
+  drawHoveredPlayer();
+
   els.altitude.textContent = bz.toFixed(1);
   try { drawMomentum(); } catch (e) { /* ignore */ }
+}
+
+/**
+ * Ring + name over the body under the cursor: the pitch's affordance for
+ * "click me for this player's analysis". Drawn last so it sits on top.
+ */
+function drawHoveredPlayer() {
+  if (!hoveredPlayer) return;
+  const hp = lastPlayers.find(
+    (p) => p.team === hoveredPlayer.team && p.shirt === hoveredPlayer.shirt,
+  );
+  if (!hp) {
+    hoveredPlayer = null;
+    return;
+  }
+  const [hx, hy] = toScreen(hp.x, hp.y);
+  const entry = dribbleIndex?.playerByKey(hp.team, hp.shirt);
+  const label = entry?.name ? `${entry.name} · #${hp.shirt}` : `#${hp.shirt}`;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(hx, hy, 10, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(47,129,247,0.95)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.font = 'bold 11px ui-sans-serif, system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const tw = ctx.measureText(label).width;
+  const boxW = tw + 14;
+  const boxH = 18;
+  // Flip below the ring at the top edge, and clamp inside the canvas, so
+  // hovering a body on the touchline never clips the label.
+  const boxY = hy - 34 < 4 ? hy + 16 : hy - 34;
+  const boxX = Math.max(2, Math.min(els.canvas.width - boxW - 2, hx - boxW / 2));
+  ctx.fillStyle = 'rgba(13,17,23,0.94)';
+  ctx.fillRect(boxX, boxY, boxW, boxH);
+  ctx.strokeStyle = 'rgba(47,129,247,0.9)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(boxX, boxY, boxW, boxH);
+  ctx.fillStyle = '#e6edf3';
+  ctx.fillText(label, boxX + boxW / 2, boxY + boxH / 2 + 0.5);
+  ctx.restore();
 }
 
 function drawGoals() {
@@ -1233,6 +1424,219 @@ if (els.shuffle) {
     syncEffectButtons();
   });
 }
+
+// ── Pitch pointer interaction ──────────────────────────────────
+// Hover reads the body under the cursor; a click opens the player context
+// menu (or filters the panel by zone); dragging pans; ctrl/cmd + wheel and
+// the zoom slider share one view transform.
+
+function hitTestPlayer(canvasX, canvasY) {
+  if (!lastPlayers.length) return null;
+  const [bx, by] = toBaseScreen(canvasX, canvasY);
+  let best = null;
+  let bestD = 11 * 11; // base-screen px: 5 px marker + slack
+  for (const p of lastPlayers) {
+    const [sx, sy] = toScreen(p.x, p.y);
+    const d = (sx - bx) * (sx - bx) + (sy - by) * (sy - by);
+    if (d < bestD) { bestD = d; best = p; }
+  }
+  return best;
+}
+
+function hitTestZone(canvasX, canvasY) {
+  if (!dribblePanel || !effects.isVisible('dribbles')) return null;
+  const [wx, wy] = fromScreen(canvasX, canvasY);
+  if (Math.abs(wx) > PITCH_W_M / 2 || Math.abs(wy) > PITCH_H_M / 2) return null;
+  return zoneOf(wx, wy, dribblePanel.layerTeam());
+}
+
+function hidePlayerMenu() {
+  const menu = els.playerContext;
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  menu.innerHTML = '';
+}
+
+/** Open the click menu for a pitch body, kept inside the stage. */
+function showPlayerMenu(player, ev) {
+  const menu = els.playerContext;
+  if (!menu || !dribbleIndex) return;
+  const entry = dribbleIndex.playerByKey(player.team, player.shirt);
+  const pid = entry ? entry.pid : null;
+  const dribbles = pid ? dribbleIndex.dribblesOf(pid) : [];
+
+  menu.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'ctx-title';
+  const strong = document.createElement('strong');
+  strong.textContent = (entry && entry.name) || `#${player.shirt}`;
+  title.appendChild(strong);
+  title.appendChild(document.createTextNode(
+    `${player.team === 0 ? 'Home' : 'Away'} · #${player.shirt}`,
+  ));
+  menu.appendChild(title);
+
+  const addItem = (label, fn) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.setAttribute('role', 'menuitem');
+    button.textContent = label;
+    button.addEventListener('click', () => { hidePlayerMenu(); fn(); });
+    menu.appendChild(button);
+  };
+
+  addItem('Open player analysis', () => {
+    if (pid) dribblePanel.open('player', { team: player.team, player: pid });
+    else setStatus('That player is not in the match roster.');
+  });
+  addItem('Show team dribble zones', () => {
+    effects.setEnabled('dribbles', true);
+    syncEffectButtons();
+    dribblePanel.open('team', { team: player.team });
+  });
+  if (dribbles.length) {
+    const first = dribbles[0];
+    addItem(`Jump to first dribble · ${formatClock(first.t)}`, () => {
+      seekTo(first.mt, `Jumped to ${formatClock(first.t)} — paused to inspect.`);
+      playing = false;
+      els.playpause.textContent = '▶ Play';
+    });
+  }
+
+  menu.hidden = false;
+  const stageRect = els.stage.getBoundingClientRect();
+  const mw = menu.offsetWidth || 214;
+  const mh = menu.offsetHeight || 140;
+  let x = ev.clientX - stageRect.left;
+  let y = ev.clientY - stageRect.top + 10;
+  if (x + mw > stageRect.width) x = Math.max(4, x - mw - 14);
+  if (y + mh > stageRect.height) y = Math.max(4, stageRect.height - mh - 6);
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  menu.querySelector('button')?.focus();
+}
+
+els.canvas.addEventListener('pointerdown', (ev) => {
+  if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+  panning = {
+    x: ev.clientX, y: ev.clientY,
+    panX: view.panX, panY: view.panY, moved: false,
+  };
+  try { els.canvas.setPointerCapture(ev.pointerId); } catch { /* ignore */ }
+});
+
+els.canvas.addEventListener('pointermove', (ev) => {
+  if (panning) {
+    const dx = ev.clientX - panning.x;
+    const dy = ev.clientY - panning.y;
+    if (Math.abs(dx) + Math.abs(dy) > 4) panning.moved = true;
+    if (panning.moved) {
+      const rect = els.canvas.getBoundingClientRect();
+      const scale = els.canvas.width / rect.width;
+      view.panX = panning.panX + dx * scale;
+      view.panY = panning.panY + dy * scale;
+      clampView();
+    }
+    return;
+  }
+  const [cx, cy] = pointerToCanvas(ev);
+  const player = hitTestPlayer(cx, cy);
+  const key = player ? `${player.team}:${player.shirt}` : '';
+  const prevKey = hoveredPlayer ? `${hoveredPlayer.team}:${hoveredPlayer.shirt}` : '';
+  if (key !== prevKey) {
+    hoveredPlayer = player;
+    els.canvas.style.cursor = player ? 'pointer' : 'default';
+  }
+  hoverZone = player ? null : hitTestZone(cx, cy);
+});
+
+els.canvas.addEventListener('pointerup', (ev) => {
+  if (!panning) return;
+  const moved = panning.moved;
+  panning = null;
+  if (moved) return; // a drag, not a click
+  const [cx, cy] = pointerToCanvas(ev);
+  const player = hitTestPlayer(cx, cy);
+  if (player) {
+    showPlayerMenu(player, ev);
+    return;
+  }
+  hidePlayerMenu();
+  const zone = hitTestZone(cx, cy);
+  if (zone != null && dribblePanel) {
+    // Clicking a zone selects it: open the team lens if the panel is shut.
+    if (!dribblePanel.isOpen()) dribblePanel.open('team', { team: dribblePanel.layerTeam() });
+    dribblePanel.setZone(dribblePanel.selectedZone === zone ? null : zone);
+  }
+});
+
+els.canvas.addEventListener('pointercancel', () => { panning = null; });
+els.canvas.addEventListener('pointerleave', () => {
+  if (panning) return;
+  hoveredPlayer = null;
+  hoverZone = null;
+  els.canvas.style.cursor = 'default';
+});
+
+// Ctrl/Cmd + wheel zooms around the cursor; a plain wheel keeps scrolling
+// the page (the zoom slider is the discoverable control).
+els.canvas.addEventListener('wheel', (ev) => {
+  if (!ev.ctrlKey && !ev.metaKey) return;
+  ev.preventDefault();
+  const [cx, cy] = pointerToCanvas(ev);
+  const z0 = view.zoom;
+  const z1 = Math.min(VIEW_ZOOM_MAX, Math.max(1, z0 * (ev.deltaY < 0 ? 1.12 : 1 / 1.12)));
+  if (z1 === z0) return;
+  // Hold the point under the cursor still while zooming.
+  const bx = (cx - CX - view.panX) / z0 + CX;
+  const by = (cy - CY - view.panY) / z0 + CY;
+  view.zoom = z1;
+  view.panX = cx - CX - z1 * (bx - CX);
+  view.panY = cy - CY - z1 * (by - CY);
+  clampView();
+  syncZoomControl();
+}, { passive: false });
+
+function syncZoomControl() {
+  if (els.zoom) els.zoom.value = String(view.zoom);
+  if (els.zoomval) els.zoomval.textContent = `${view.zoom.toFixed(2)}×`;
+}
+
+if (els.zoom) {
+  els.zoom.addEventListener('input', () => {
+    view.zoom = parseFloat(els.zoom.value) || 1;
+    clampView();
+    syncZoomControl();
+  });
+}
+if (els.resetView) {
+  els.resetView.addEventListener('click', () => {
+    view.zoom = 1;
+    view.panX = 0;
+    view.panY = 0;
+    syncZoomControl();
+    setStatus('View reset.');
+  });
+}
+if (els.zoneAlpha) {
+  els.zoneAlpha.addEventListener('input', () => {
+    zoneAlpha = Math.min(1, Math.max(0.15, parseFloat(els.zoneAlpha.value) || 0.55));
+    if (els.zoneAlphaVal) els.zoneAlphaVal.textContent = `${Math.round(zoneAlpha * 100)}%`;
+  });
+}
+syncZoomControl();
+
+// Click-away and Escape dismiss the context menu (the panel hides itself
+// through its own keydown handler when focus is inside it).
+document.addEventListener('pointerdown', (ev) => {
+  const menu = els.playerContext;
+  if (!menu || menu.hidden) return;
+  if (menu.contains(ev.target) || ev.target === els.canvas) return;
+  hidePlayerMenu();
+});
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') hidePlayerMenu();
+});
 els.playpause.addEventListener('click', () => {
   playing = !playing;
   els.playpause.textContent = playing ? '⏸ Pause' : '▶ Play';
@@ -1260,9 +1664,19 @@ els.browse.addEventListener('click', browseDirectory);
 
 function seekBy(seconds) {
   if (!engine) return;
-  const target = engine.get_sim_time() + seconds;
+  seekTo(engine.get_sim_time() + seconds);
+}
+
+/**
+ * Absolute seek on the engine's match clock (the rebased chronology the
+ * analysis log's `match_secs` column shares). Resets every transient
+ * overlay so a jump never replays stale choreography.
+ */
+function seekTo(target, message) {
+  if (!engine) return;
   const dur = engine.get_duration_secs();
-  engine.seek_to(Math.max(0, Math.min(dur, target)));
+  const clamped = Math.max(0, Math.min(dur, target));
+  engine.seek_to(clamped);
   lastEventSeq = -1;
   resetSequenceCursor();
   resetOverlayState();
@@ -1296,7 +1710,7 @@ function seekBy(seconds) {
   lastPasser[0] = { id: '', pos: null };
   lastPasser[1] = { id: '', pos: null };
   els.feed.innerHTML = '';
-  setStatus(`Jumped to ${Math.floor(Math.max(0, target) / 60)} min`);
+  setStatus(message ?? `Jumped to ${Math.floor(clamped / 60)} min`);
 }
 els.xmlpath.addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter') loadFromPath();
@@ -1453,5 +1867,17 @@ async function main() {
   }
   requestAnimationFrame(loop);
 }
+
+// Read-only introspection handle for automated checks and console
+// debugging: exposes live references, never mutates the sim itself.
+window.__gev = {
+  get engine() { return engine; },
+  get players() { return lastPlayers; },
+  get panel() { return dribblePanel; },
+  get index() { return dribbleIndex; },
+  get view() { return view; },
+  toScreen,
+  seekTo,
+};
 
 main();

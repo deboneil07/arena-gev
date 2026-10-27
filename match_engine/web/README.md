@@ -17,8 +17,15 @@ web/
 ├── graphs.test.mjs
 ├── effects.js         # analytical layer toggles + shuffle state
 ├── effects.test.mjs
+├── dribbles.js        # pure whole-match dribble analysis (zones, stats, insights)
+├── dribbles.test.mjs
+├── dribbleOverlay.js  # Canvas drawing for the 12-zone dribble heat layer
+├── dribbleOverlay.test.mjs
+├── playerPanel.js     # slide-in analysis panel (team lens + per-player lens)
+├── playerPanel.test.mjs
 ├── transitions.js     # renderer-only substitution choreography
 ├── transitions.test.mjs
+├── smoke.test.mjs     # boots app.js under a stub DOM (link/id/render checks)
 ├── smoke_test.cjs     # end-to-end test of the compiled .wasm (Node)
 └── README.md
 ```
@@ -158,7 +165,8 @@ count, not relative to the strongest link).
 The effects bar above the pitch controls each analytical layer independently:
 **Heatmap**, **Passing network**, **Offside line**, **Analysis** (carrier ring,
 THREAT arrow/text, press ring and defensive hull), **Pass lanes**, **Run
-channels** and **Vision cone**. All are on by default, so the initial view is
+channels**, **Vision cone** and **Dribbles**. All are on by default, so the
+initial view is
 unchanged. Hiding a layer only skips its draw call: the samplers and trackers
 keep running, so switching it back on resumes the live state instead of
 resetting it. Toggle choices persist across seeks, restarts and match loads.
@@ -182,6 +190,66 @@ are DOM-free and covered by Node tests:
 ```bash
 node --test web/*.test.mjs
 ```
+
+## Dribble analysis
+
+The **Dribbles** effect draws a whole-match take-on/carry layer over the pitch,
+and clicking into it opens a slide-in analysis panel. Everything is derived
+once per match from `engine.get_analysis_json()` (a static schema-v1 log of
+every event plus both rosters), so results never depend on playback position —
+seeking, pausing and switching matches all stay consistent.
+
+### Pitch layer
+
+- The pitch is divided into **12 zones** (4 rows × 3 columns) defined in the
+  **attacker's own frame**: home attacks +x, away's view is mirrored on both
+  axes, so zone 1 is always "own third, defender's left". Zone ids 1–12 run
+  row-major and are printed in the corner of every cell.
+- Each used zone is washed with a heat colour scaled to its attempt volume and
+  tinted by success rate; empty zones stay unwashed. The **Zones** slider in
+  the view controls sets the layer opacity (default 55 %).
+- Attempt markers sit at the dribble's start: **✓** green = won take-on
+  (arrow to where the ball was carried/received within 5 s), **✗** red = lost
+  take-on, **○** blue = progressive carry. Sequence numbers appear while the
+  team has 20 attempts or fewer.
+- Clicking a zone selects it: the zone is outlined on the pitch, a clearable
+  chip appears in the panel, the zone table and zone-map ring highlight that
+  row, and the timeline dims attempts from other zones (its click-to-seek
+  then only lands on this zone's attempts). Zone ids live in the attacker's
+  frame, so a selection follows the team lens through possession flips.
+  Hovering pre-highlights the cell.
+
+### Analysis panel
+
+Open it from a zone click, from a player's context menu (**Open player
+analysis**), or from **Show team dribble zones**; `Escape` closes it. The team
+lens follows the pitch's followed side (and flips with it live) unless the
+per-player lens is open.
+
+- **Filters** — half (1st/2nd/both), game state (ahead/level/behind) and a
+  player picker apply to every stat in the view.
+- **Team lens** — attempt/success/shot-after totals, the busiest-zone table
+  (click a row to select that zone), the ✓/✗/○ effectiveness scale, rule-based
+  insights and the squad list (click a player to switch lenses).
+- **Player lens** — four percentile metrics vs team-mates with ≥2 dribbles
+  (attempts, success rate, gain, shot-after rate) with star ratings; a
+  **per-zone circle map** where circle *size* = attempts, *fill* = success
+  rate and *ring* = confidence (few attempts → fainter ring); a thirds split;
+  and a **minute strip** of every attempt across the 90 minutes. Clicking the
+  strip seeks the sim to that attempt (read-only scrubber — it jumps, it does
+  not scrub). The view's **Export** button downloads the current view,
+  filters and every attempt as JSON.
+
+### View controls
+
+**Zoom** (slider; ctrl/cmd + wheel also zooms), drag-to-pan on the pitch and
+**Reset view**. The transform is a single canvas matrix — identity at rest,
+so hit tests and export coordinates stay honest. Plain wheel still scrolls
+the page; touch keeps vertical page scrolling (`touch-action: pan-y`).
+
+`window.__gev` exposes read-only handles (`engine`, `players`, `panel`,
+`index`, `view`, `toScreen`, `seekTo`) for console debugging and automated
+checks.
 
 ## Off-ball movement, phases & substitutions
 

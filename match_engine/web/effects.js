@@ -13,6 +13,7 @@ export const EFFECTS = Object.freeze([
   Object.freeze({ key: 'passingLanes', label: 'Pass lanes' }),
   Object.freeze({ key: 'attackChannels', label: 'Run channels' }),
   Object.freeze({ key: 'visionCone', label: 'Vision cone' }),
+  Object.freeze({ key: 'dribbles', label: 'Dribble zones' }),
 ]);
 
 export const SHUFFLE_SECONDS = 4;

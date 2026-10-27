@@ -406,6 +406,13 @@ impl MatchRenderer {
         &self.engine
     }
 
+    /// Compact JSON snapshot of every gameplay event plus both rosters,
+    /// for the browser's dribble / player analysis panels. Built on demand;
+    /// the result is static for the loaded match (seek-safe by construction).
+    pub fn analysis_json(&self) -> String {
+        crate::analysis_log::build(&self.engine)
+    }
+
     /// Origin (x, y) of the most recently dispatched event snapshot.
     pub fn last_event_origin(&self) -> (f32, f32) {
         self.engine
@@ -566,6 +573,16 @@ mod glue {
         /// Kick-off date as recorded by the feed.
         pub fn get_game_date(&self) -> String {
             self.inner.engine().game_date().to_string()
+        }
+
+        // ── Whole-match analysis log (dribble / player panels) ──
+
+        /// Compact JSON blob: every gameplay event (type, clocks, team,
+        /// player id/name, origin/end coordinates, outcome) plus both
+        /// rosters with resolved display names. Parsed once per match by
+        /// the front end; unaffected by seeks.
+        pub fn get_analysis_json(&self) -> String {
+            self.inner.analysis_json()
         }
 
         // ── Event feed (for splash banners + the running commentary) ──

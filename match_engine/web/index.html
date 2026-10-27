@@ -94,6 +94,8 @@
       display: block;
       max-width: 100%;
       height: auto;
+      touch-action: pan-y;
+      cursor: default;
     }
     /* Centre splash for big moments (inside the pitch). */
     #splash {
@@ -197,6 +199,208 @@
       border-radius: 2px; border: 1px solid #30363d;
       background: linear-gradient(90deg, rgba(255, 236, 170, 0.9), rgba(255, 190, 90, 0.9) 48%, rgba(140, 200, 255, 0.9) 52%, rgba(110, 160, 255, 0.9));
     }
+
+    :focus-visible { outline: 2px solid #2f81f7; outline-offset: 2px; }
+
+    /* ── Dribble analysis: view controls under the pitch ─────── */
+    #view-controls {
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap; justify-content: center;
+      margin-top: 8px; font-size: 11.5px; color: #8b949e;
+    }
+    #view-controls label { display: inline-flex; align-items: center; gap: 6px; }
+    #view-controls input[type="range"] { width: 92px; }
+    #view-controls button { font-size: 11.5px; padding: 4px 10px; }
+    #view-controls .val { color: #c9d1d9; font-variant-numeric: tabular-nums; min-width: 42px; }
+    #view-controls .vc-sep { width: 1px; height: 14px; background: #30363d; }
+
+    /* ── Player context menu (pitch click) ───────────────────── */
+    #player-context {
+      position: absolute; z-index: 30; min-width: 214px;
+      background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55); padding: 6px;
+    }
+    #player-context[hidden] { display: none; }
+    #player-context .ctx-title {
+      font-size: 11px; color: #8b949e; padding: 4px 8px 7px;
+      border-bottom: 1px solid #21262d; margin-bottom: 4px; line-height: 1.5;
+    }
+    #player-context .ctx-title strong { color: #e6edf3; display: block; font-size: 13px; }
+    #player-context button {
+      display: block; width: 100%; text-align: left; background: transparent;
+      border: 0; color: #c9d1d9; font-size: 12.5px; padding: 7px 8px; border-radius: 6px;
+    }
+    #player-context button:hover { background: #2f81f7; color: #fff; }
+
+    /* ── Analysis panel: right slide-in (bottom sheet on small) ─ */
+    #player-panel {
+      position: fixed; top: 0; right: 0; z-index: 40;
+      width: 374px; max-width: 100vw; height: 100vh;
+      display: flex; flex-direction: column;
+      background: #0d1117; border-left: 1px solid #30363d;
+      box-shadow: -24px 0 48px rgba(0, 0, 0, 0.5);
+      visibility: hidden; transform: translateX(102%);
+      transition: transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1), visibility 0s linear 240ms;
+    }
+    #player-panel.is-open {
+      visibility: visible; transform: none;
+      transition: transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1), visibility 0s;
+    }
+    .pp-head { display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; padding: 12px 14px 0; }
+    .pp-tabs { display: inline-flex; background: #161b22; border: 1px solid #21262d;
+      border-radius: 8px; padding: 3px; gap: 3px; }
+    .pp-tabs [role="tab"] { border: 0; background: transparent; color: #8b949e;
+      font-size: 12px; padding: 5px 16px; border-radius: 6px; }
+    .pp-tabs [role="tab"][aria-selected="true"] { background: #2f81f7; color: #fff; font-weight: 600; }
+    .pp-close { border: 0; background: transparent; color: #8b949e; font-size: 15px;
+      padding: 4px 9px; line-height: 1; border-radius: 6px; }
+    .pp-close:hover { color: #e6edf3; background: #21262d; }
+    .pp-context { padding: 8px 14px 0; font-size: 12px; color: #8b949e;
+      font-variant-numeric: tabular-nums; }
+    .pp-body { flex: 1; overflow-y: auto; padding: 10px 14px 14px;
+      display: flex; flex-direction: column; gap: 12px; }
+    .pp-body::-webkit-scrollbar { width: 8px; }
+    .pp-body::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+    .pp-body::-webkit-scrollbar-track { background: transparent; }
+    .pp-actions { display: flex; gap: 8px; padding: 10px 14px; flex-wrap: wrap;
+      border-top: 1px solid #21262d; }
+    .pp-btn { font-size: 12px; padding: 6px 12px; }
+    .pp-btn-primary { border-color: #2f81f7; background: rgba(47, 129, 247, 0.16); }
+
+    .pp-block { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px; }
+    .pp-block-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+      color: #8b949e; margin-bottom: 8px; font-weight: 600; }
+    .pp-block-title .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: #6e7681; }
+
+    .pp-filters { display: flex; gap: 8px; flex-wrap: wrap; }
+    /* max-content floor: a select is never narrower than its longest option,
+       so the panel truncates nothing at the default 374px width — the row
+       wraps instead if a name genuinely cannot fit. */
+    .pp-select { background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+      border-radius: 6px; padding: 5px 8px; font-size: 12px; flex: 1 1 auto; min-width: max-content; }
+
+    .pp-chip { align-self: flex-start; font-size: 11px; padding: 4px 10px;
+      border-radius: 999px; border-color: rgba(255, 190, 90, 0.55); color: #ffbe5a;
+      background: rgba(255, 190, 90, 0.1); }
+
+    .pp-summary { display: flex; gap: 16px; flex-wrap: wrap; font-size: 11.5px; color: #8b949e; }
+    .pp-summary strong { color: #e6edf3; font-size: 15px; font-variant-numeric: tabular-nums;
+      display: block; font-weight: 650; }
+
+    .pp-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .pp-table th { text-align: left; font-size: 10px; text-transform: uppercase;
+      letter-spacing: 0.8px; color: #8b949e; font-weight: 600; padding: 4px 6px;
+      border-bottom: 1px solid #21262d; }
+    .pp-table td { padding: 5px 6px; border-bottom: 1px solid #21262d; color: #c9d1d9;
+      font-variant-numeric: tabular-nums; }
+    .pp-table tbody tr { cursor: pointer; }
+    .pp-table tbody tr:hover { background: #21262d; }
+    .pp-table tbody tr.is-selected { background: rgba(255, 190, 90, 0.12); }
+    .pp-table tbody tr:focus-visible { outline: 2px solid #2f81f7; outline-offset: -2px; }
+    /* Zone cells stack the id above its name on purpose: a third column
+       would squeeze the numbers, and wrapping mid-label reads as an error. */
+    .pp-zone-name { display: block; color: #8b949e; font-size: 10.5px;
+      line-height: 1.25; }
+    .pp-compare td:nth-child(n + 2), .pp-compare th:nth-child(n + 2) { text-align: right; }
+
+    .pp-scale { display: flex; flex-direction: column; gap: 4px; }
+    .pp-scale-row { display: grid; grid-template-columns: 56px 1fr 82px; gap: 8px;
+      align-items: center; font-size: 11px; }
+    .pp-scale-range { color: #8b949e; font-variant-numeric: tabular-nums; }
+    .pp-scale-bar { height: 7px; border-radius: 2px; }
+    .pp-scale-label { color: #c9d1d9; text-align: right; }
+    .pp-scale-row:nth-child(1) .pp-scale-bar { background: #3fd07c; }
+    .pp-scale-row:nth-child(2) .pp-scale-bar { background: #7bd86a; }
+    .pp-scale-row:nth-child(3) .pp-scale-bar { background: #b7dd55; }
+    .pp-scale-row:nth-child(4) .pp-scale-bar { background: #e6c74a; }
+    .pp-scale-row:nth-child(5) .pp-scale-bar { background: #eda24b; }
+    .pp-scale-row:nth-child(6) .pp-scale-bar { background: #ef7a4b; }
+    .pp-scale-row:nth-child(7) .pp-scale-bar { background: #ef4b4b; }
+
+    .pp-roster { display: flex; flex-direction: column; gap: 4px; }
+    .pp-player-btn { display: flex; align-items: center; gap: 8px; width: 100%;
+      background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
+      padding: 6px 9px; font-size: 12px; text-align: left; }
+    .pp-player-btn:hover { border-color: #2f81f7; background: #161b22; }
+    .pp-shirt { color: #8b949e; font-variant-numeric: tabular-nums; min-width: 28px; }
+    .pp-player-name { color: #e6edf3; flex: 1; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; }
+    .pp-player-att { color: #8b949e; font-size: 11px; }
+
+    .pp-identity { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+    .pp-name { font-size: 16px; color: #e6edf3; font-weight: 650; display: flex;
+      gap: 8px; align-items: baseline; }
+    .pp-shirt-big { color: #8b949e; font-size: 13px; font-weight: 500;
+      font-variant-numeric: tabular-nums; }
+    .pp-meta { font-size: 11.5px; color: #8b949e; white-space: nowrap; }
+
+    .pp-metrics { display: flex; flex-direction: column; gap: 6px; }
+    .pp-metric { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px;
+      background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 7px 10px; }
+    .pp-metric-label { font-size: 11px; color: #8b949e; }
+    .pp-metric-value { font-size: 15px; font-weight: 650; color: #e6edf3; text-align: right;
+      font-variant-numeric: tabular-nums; grid-row: span 2; align-self: center; }
+    .pp-metric-pct { display: flex; align-items: center; gap: 6px; }
+    .pp-pct { flex: 1; height: 5px; background: #21262d; border-radius: 3px; overflow: hidden; }
+    .pp-pct i { display: block; height: 100%; background: #2f81f7; }
+    .pp-metric-star { color: #ffbe5a; font-size: 10px; letter-spacing: 1px; }
+
+    .pp-facts { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; color: #8b949e; }
+    .pp-facts strong { color: #e6edf3; font-variant-numeric: tabular-nums; }
+
+    .pp-canvas-wrap { position: relative; }
+    .pp-zonemap { width: 100%; height: auto; display: block; border-radius: 6px;
+      border: 1px solid #30363d; background: #1e3822; cursor: crosshair; }
+    .pp-canvas-legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 10.5px;
+      color: #8b949e; margin-top: 6px; }
+    .pp-strip { width: 100%; height: auto; display: block; background: #0d1117;
+      border: 1px solid #21262d; border-radius: 6px; cursor: pointer; }
+
+    .pp-tooltip { position: absolute; z-index: 5; pointer-events: none;
+      background: rgba(13, 17, 23, 0.96); border: 1px solid #30363d; border-radius: 6px;
+      padding: 6px 9px; font-size: 11px; color: #c9d1d9; line-height: 1.55;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); white-space: nowrap; }
+    .pp-tooltip[hidden] { display: none; }
+    .pp-tooltip strong { color: #e6edf3; }
+
+    .pp-third { display: flex; align-items: baseline; gap: 8px; padding: 5px 0;
+      border-bottom: 1px solid #21262d; font-size: 12px; }
+    .pp-third:last-child { border-bottom: 0; }
+    .pp-third-name { color: #e6edf3; min-width: 112px; }
+    .pp-third-stats { color: #8b949e; flex: 1; font-variant-numeric: tabular-nums; }
+    .pp-third-rating { color: #ffbe5a; font-size: 11px; }
+
+    .pp-insights { display: flex; flex-direction: column; gap: 6px; }
+    .pp-insight { border-left: 3px solid #30363d; background: #161b22;
+      border-radius: 0 6px 6px 0; padding: 7px 10px; font-size: 12px; }
+    .pp-insight-strength { border-left-color: #50dc8c; }
+    .pp-insight-concern { border-left-color: #f85149; }
+    .pp-insight-pattern { border-left-color: #2f81f7; }
+    .pp-insight-opportunity { border-left-color: #ffbe5a; }
+    .pp-insight-title { color: #e6edf3; font-weight: 600; margin-bottom: 2px; }
+    .pp-insight-body { color: #8b949e; line-height: 1.55; }
+
+    .pp-empty { font-size: 12px; color: #8b949e; background: #161b22;
+      border: 1px dashed #30363d; border-radius: 8px; padding: 14px 12px; line-height: 1.6; }
+    .pp-empty-title { color: #e6edf3; font-weight: 600; margin-bottom: 4px; }
+    .pp-empty-body { color: #8b949e; }
+
+    /* Player lens: a blue rail down the body so the scope is obvious at a
+       glance without relying on the tab alone. Inset, so nothing shifts. */
+    .pp-body.is-player { box-shadow: inset 2px 0 0 rgba(47, 129, 247, 0.5); }
+
+    @media (max-width: 900px) {
+      #player-panel {
+        top: auto; bottom: 0; width: 100%; height: 64vh;
+        border-left: 0; border-top: 1px solid #30363d;
+        transform: translateY(102%);
+      }
+      #player-panel.is-open { transform: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #player-panel { transition: none; }
+      #feed .row { animation: none; }
+    }
   </style>
 </head>
 <body>
@@ -245,6 +449,8 @@
       title="Forward run channels">Run channels</button>
     <button type="button" class="effect-toggle" data-effect="visionCone" aria-pressed="true"
       title="Visible and blind vision sectors">Vision cone</button>
+    <button type="button" class="effect-toggle" data-effect="dribbles" aria-pressed="true"
+      title="12-zone dribble heatmap with per-attempt markers">Dribble zones</button>
     <span class="effect-sep" aria-hidden="true"></span>
     <button type="button" id="shuffle-effects" aria-pressed="false"
       title="Show one enabled analytical effect at a time">🔀 Shuffle effects</button>
@@ -265,6 +471,21 @@
         <div class="ht-score" id="ht-score">0 – 0</div>
         <div class="ht-sub">Second half kicks off shortly</div>
       </div>
+      <div id="player-context" role="menu" aria-label="Player actions" hidden></div>
+      <div id="view-controls">
+        <label>Zoom
+          <input type="range" id="zoom" min="1" max="2.5" step="0.05" value="1"
+            aria-label="Pitch zoom" />
+          <span class="val" id="zoomval">1.00×</span>
+        </label>
+        <button type="button" id="reset-view">Reset view</button>
+        <span class="vc-sep" aria-hidden="true"></span>
+        <label>Zones
+          <input type="range" id="zone-alpha" min="0.15" max="1" step="0.05" value="0.55"
+            aria-label="Dribble zone layer opacity" />
+          <span class="val" id="zone-alphaval">55%</span>
+        </label>
+      </div>
     </div>
     <aside id="sidebar">
       <h2>Live Events</h2>
@@ -277,6 +498,21 @@
       <canvas id="momentum" width="300" height="90"></canvas>
     </aside>
   </div>
+
+  <aside id="player-panel" aria-label="Dribble analysis">
+    <div class="pp-head">
+      <div class="pp-tabs" role="tablist" aria-label="Analysis scope">
+        <button type="button" role="tab" data-tab="team" aria-selected="true"
+          aria-controls="pp-body">Team</button>
+        <button type="button" role="tab" data-tab="player" aria-selected="false"
+          aria-controls="pp-body" tabindex="-1">Player</button>
+      </div>
+      <button type="button" class="pp-close" aria-label="Close analysis panel">✕</button>
+    </div>
+    <div class="pp-context"></div>
+    <div class="pp-body" id="pp-body" role="tabpanel"></div>
+    <div class="pp-actions"></div>
+  </aside>
 
   <div class="legend">
     <span><i class="swatch" style="background:#f2f2f2"></i>Home</span>
@@ -291,8 +527,13 @@
     <span><i class="line-swatch" style="border-top-color:#ff6e6e;border-top-style:dotted"></i>Blind</span>
     <span><i class="swatch" style="background:#b478ff"></i>Player heat</span>
     <span><i class="heat-swatch"></i>Heat · match so far</span>
+    <span class="legend-sep"></span>
+    <span><i class="swatch" style="background:#50dc8c"></i>Won dribble</span>
+    <span><i class="swatch" style="background:#ff5c5c"></i>Lost dribble</span>
+    <span><i class="swatch" style="background:#6eb4ff"></i>Progressive carry</span>
+    <span><i class="heat-swatch" style="background:linear-gradient(90deg, rgba(80,220,140,0.75), rgba(230,199,74,0.75), rgba(239,75,75,0.75))"></i>Zones · dribble volume</span>
   </div>
 
-  <script type="module" src="./app.js?v=17"></script>
+  <script type="module" src="./app.js?v=18"></script>
 </body>
 </html>
