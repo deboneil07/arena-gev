@@ -15,6 +15,8 @@ web/
 ├── overlays.test.mjs  # headless Canvas-harness tests for the draw routines
 ├── graphs.js          # momentum strip + passing network accumulators
 ├── graphs.test.mjs
+├── effects.js         # analytical layer toggles + shuffle state
+├── effects.test.mjs
 ├── transitions.js     # renderer-only substitution choreography
 ├── transitions.test.mjs
 ├── smoke_test.cjs     # end-to-end test of the compiled .wasm (Node)
@@ -81,7 +83,7 @@ A right-hand **sidebar** shows the last 8 events (time · type, colour-coded by
 team). **Goals, cards, fouls, corners, offsides and substitutions** also
 trigger a large centre splash. The HUD carries a **scoreboard**, a
 **possession bar** and ball altitude; both **goal nets** are rendered.
-**⏪/⏩ 10 min** buttons seek through the match for analysis.
+**⏪/⏩ 5 min** buttons seek through the match for analysis.
 
 All of it reads straight from the engine via the bridge:
 
@@ -95,7 +97,7 @@ engine.get_score_away();
 engine.get_possession_home();      // 0..1 possession bar
 engine.get_player_role(i);         // 0 unknown, 1 GK, 2 DEF, 3 MID, 4 FWD
 engine.get_possession_team();      // 0 home, 1 away, -1 neutral
-engine.seek_to(600);               // jump to 10:00 (rebuilds + fast-forwards)
+engine.seek_to(300);               // jump to 05:00 (rebuilds + fast-forwards)
 ```
 
 ## Team analysis overlays
@@ -103,7 +105,8 @@ engine.seek_to(600);               // jump to 10:00 (rebuilds + fast-forwards)
 The overlays **follow possession**: exactly one team is shown at a time (the
 side in possession). The layer waits for 0.35 s of stable possession and then
 crossfades over 0.18 s, so turnovers never cause the whole analysis to
-flicker. All three views are always on for that team; there is no toggle.
+flicker. Every analytical layer is on by default and can be switched off
+independently from the effects bar above the pitch.
 
 - **Shape (triangle)** — three unit segments traced through the current
   defenders, midfielders and forwards (the GK is excluded), plus a translucent
@@ -121,8 +124,57 @@ flicker. All three views are always on for that team; there is no toggle.
   position.
 - **Momentum strip** — sidebar canvas: cumulative model-estimate threat per
   team with goal/shot/card ticks.
+- **Passing lanes** — live arrows from the ball to the best receivers. The
+  geometry is re-scored at 10 Hz and the endpoints resolve every frame, so
+  the arrow stays attached to the moving ball and receiver. Each lane grows
+  from the ball, with opacity/width driven by a logistic completion
+  probability (corridor clearance, distance, receiver pressure, xT gain).
+- **Run channels** — live 6–12 m forward runs the attackers should make
+  during a progression, scored by xT gain and the time gained on the nearest
+  defender. The arrow is anchored to the runner, its weight scales with the
+  score, bows away from the nearest defender, and grows from a point with an
+  eased extension.
+- **Vision cone** — a translucent sector for the carrier. Every player has a
+  stable individual profile: radius 16–28 m and half-angle 48–72° (deterministic
+  from team + shirt), so narrow and wide-vision players read differently. The
+  cone faces the best available pass (not the ball at the carrier's feet).
+  Teammates in the cone with a clear sightline are joined in teal; the rest
+  of the near circle is the blind sector with dotted red links. Occlusion by
+  an opponent downgrades a teammate to blind.
+- **Player heat** — the analysis minimap sometimes shows a randomly chosen
+  player's cumulative heat (rotates every 45 s, resets with the followed team).
 - **Scripted sequences** — goal mob, save puff, woodwork ping, card/penalty
   banners; all renderer ghosts, all seek-safe.
+
+The passing network is anchored to the live player positions and shows while
+the followed team still has the ball, after at least three consecutive passes.
+A sustained interception breaks the retained sequence immediately (the layer
+hides as soon as possession is lost). A new pair's link is almost invisible and
+darkens only as those two players keep exchanging the ball (absolute pass
+count, not relative to the strongest link).
+
+### Effect toggles & shuffle
+
+The effects bar above the pitch controls each analytical layer independently:
+**Heatmap**, **Passing network**, **Offside line**, **Analysis** (carrier ring,
+THREAT arrow/text, press ring and defensive hull), **Pass lanes**, **Run
+channels** and **Vision cone**. All are on by default, so the initial view is
+unchanged. Hiding a layer only skips its draw call: the samplers and trackers
+keep running, so switching it back on resumes the live state instead of
+resetting it. Toggle choices persist across seeks, restarts and match loads.
+
+**🔀 Shuffle effects** shows exactly one enabled layer at a time and advances
+every 4 seconds, wrapping through the enabled set. The current layer's button
+is highlighted. Turning Shuffle off restores the normal view for every enabled
+toggle. Disabling the layer currently on screen moves Shuffle to the next
+enabled layer; if no layers are enabled, Shuffle shows nothing.
+
+Set-piece robustness: a corner holds the ball at the flag while the box fills.
+If the feed includes a delivery pass, that cross is used; if the synthetic feed
+omits it, the engine stages a plausible delivery itself. Goalkeepers are never
+selected as corner/free-kick/throw-in takers and are leashed to their own goal.
+Duplicate "player on" rows in synthetic feeds are ignored so two bodies can
+never share one identity (which used to tear the goalkeeper's anchor apart).
 
 The pure geometry and accumulators (`analysis.js`, `heatmap.js`, `graphs.js`)
 are DOM-free and covered by Node tests:

@@ -5,21 +5,35 @@
 // zero-copy Float32Array view into WASM linear memory.
 
 import init, { WasmMatchEngine } from './pkg/match_engine.js';
-import { ROLE, applyRoles, formationLabel } from './analysis.js';
+import {
+  ROLE,
+  applyRoles,
+  attackChannels,
+  formationLabel,
+  passingLaneCandidates,
+  visionCone,
+} from './analysis.js';
 import {
   drawAnalysis,
+  drawAttackChannels,
   drawCelebrationFx,
   drawEventFx,
   drawHeatmap,
   drawOffsideLine,
+  drawPassingLanes,
+  drawPassingNetwork,
   drawSubstitutionFx,
+  drawVisionCone,
 } from './overlays.js';
 import { createSubstitutionTracker } from './transitions.js';
 import { createCelebrationTracker, createFxTracker } from './sequences.js';
 import { createMomentumTracker, createPassingNetwork, rowValue, seqNumber } from './graphs.js';
 import { createHeatmap } from './heatmap.js';
+import { createPassingLaneTracker } from './passingLanes.js';
+import { createAttackChannelTracker } from './attackChannels.js';
 import { createMinimap } from './minimap.js';
 import { createHighlightTracker } from './highlights.js';
+import { createEffectController } from './effects.js';
 
 const ENTITY_STRIDE = 6;
 const PITCH_W_M = 105.0;
@@ -56,9 +70,10 @@ const els = {
   posshome: document.getElementById('posshome'),
   possaway: document.getElementById('possaway'),
   possval: document.getElementById('possval'),
-  back10: document.getElementById('back10'),
-  fwd10: document.getElementById('fwd10'),
+  back5: document.getElementById('back5'),
+  fwd5: document.getElementById('fwd5'),
   browse: document.getElementById('browse'),
+  shuffle: document.getElementById('shuffle-effects'),
   filelist: document.getElementById('filelist'),
   matchList: document.getElementById('match-list'),
   matchInfo: document.getElementById('match-info'),
@@ -69,6 +84,20 @@ const els = {
 };
 
 const ctx = els.canvas.getContext('2d');
+const effectButtons = Array.from(document.querySelectorAll('[data-effect]'));
+const effects = createEffectController();
+
+/** Keep the effect bar's pressed/current state in sync with the controller. */
+function syncEffectButtons() {
+  const shuffleOn = effects.shuffleActive;
+  for (const button of effectButtons) {
+    const key = button.dataset.effect;
+    button.setAttribute('aria-pressed', String(effects.isEnabled(key)));
+    button.classList.toggle('shuffle-current', shuffleOn && effects.currentKey === key);
+  }
+  if (els.shuffle) els.shuffle.setAttribute('aria-pressed', String(shuffleOn));
+}
+syncEffectButtons();
 
 // ── World → screen ─────────────────────────────────────────────
 // Engine x ∈ [-52.5, 52.5] (home attacks +x → right).
@@ -221,6 +250,25 @@ const celebrations = createCelebrationTracker();
 const fx = createFxTracker();
 const momentum = createMomentumTracker();
 const passingNet = createPassingNetwork();
+const passingLanes = createPassingLaneTracker();
+const attackChannelsFx = createAttackChannelTracker();
+// Player-only heatmap (minimap).
+const playerHeat = createHeatmap();
+let chosenPlayerShirt = null;
+let playerHeatTimer = 0;
+let lastPlayerHeatTeam = -1;
+let lastPlayerHeatSample = -Infinity;
+// Live overlays: sample the geometry at 10 Hz, resolve endpoints every frame.
+let lastLaneCompute = -Infinity;
+let lastLaneData = [];
+let lastChannelCompute = -Infinity;
+let lastChannelData = [];
+// Frame-to-frame velocity per team:shirt (the render buffer has no velocity).
+const playerVelocity = new Map();
+let visionAlpha = 0;
+let lastVisionCarrier = '';
+let lastVisionCone = null;
+let visionFocus = null;
 // Per-team last passer (link consecutive same-team rows into network edges).
 const lastPasser = [{ id: '', pos: null }, { id: '', pos: null }];
 // Cursor for the sequence tracker (goal mob / save puff / flag / banner
@@ -281,6 +329,50 @@ function sampleHeat(players, simTime) {
   heat[1].sample(away);
 }
 
+/** Sample a single randomly chosen player's positions into playerHeat. */
+function samplePlayerHeat(players, simTime) {
+  // Reset when followed team changes
+  if (lastPlayerHeatTeam !== displayTeam) {
+    lastPlayerHeatTeam = displayTeam;
+    chosenPlayerShirt = null;
+    playerHeat.reset();
+    playerHeatTimer = simTime;
+  }
+  if (chosenPlayerShirt === null) {
+    // pick a random outfield player from the followed team
+    const teamPlayers = players.filter((p) => p.team === displayTeam);
+    if (teamPlayers.length === 0) return;
+    const pick = teamPlayers[Math.floor(Math.random() * teamPlayers.length)];
+    chosenPlayerShirt = pick.shirt;
+    playerHeat.reset();
+    playerHeatTimer = simTime;
+  }
+  // rotate chosen player every ~45s of sim time
+  if (simTime - playerHeatTimer > 45) {
+    const teamPlayers = players.filter((p) => p.team === displayTeam);
+    if (teamPlayers.length > 0) {
+      const pick = teamPlayers[Math.floor(Math.random() * teamPlayers.length)];
+      chosenPlayerShirt = pick.shirt;
+      playerHeat.reset();
+    }
+    playerHeatTimer = simTime;
+  }
+  // expose to minimap data
+  if (minimap && minimap.data) {
+    minimap.data.playerHeat = playerHeat;
+    minimap.data.chosenPlayerShirt = chosenPlayerShirt;
+  }
+  if (simTime - lastPlayerHeatSample < HEAT_SAMPLE_DT) return;
+  lastPlayerHeatSample = simTime;
+  const chosen = players.find((p) => p.team === displayTeam && p.shirt === chosenPlayerShirt);
+  if (chosen) playerHeat.sample([chosen]);
+  else if (chosenPlayerShirt !== null) {
+    // Substituted or sent off: pick a fresh subject on the next sample.
+    chosenPlayerShirt = null;
+    playerHeat.reset();
+  }
+}
+
 /** Follow possession with hysteresis and a short crossfade. */
 function updateFollowedTeam(possessionTeam, dt) {
   if (possessionTeam === 0 || possessionTeam === 1) {
@@ -293,6 +385,16 @@ function updateFollowedTeam(possessionTeam, dt) {
         displayTeam = possessionTeam;
         possessHold = 0;
         teamBlend = 0;
+        // Interception: a sustained change of possession ends the retained
+        // passing sequence (the network hides immediately while the old team
+        // is out of possession, and the streak resets on this switch).
+        passingNet.breakRetention();
+        // Transient overlays belong to the old team; never show them under
+        // the new team's colours during the crossfade.
+        passingLanes.reset();
+        attackChannelsFx.reset();
+        lastLaneData = [];
+        lastChannelData = [];
       }
     }
   } else {
@@ -324,8 +426,21 @@ function drawOverlays(players, possessionTeam, setPieceActive, dt, ball) {
   teams.push({ team: displayTeam, alpha: teamBlend < 1 ? teamBlend : 1 });
 
   const rect = { x: OFFSET_X, y: OFFSET_Y, w: PITCH_PX_W, h: PITCH_PX_H };
-  for (const { team, alpha } of teams) {
-    drawHeatmap(ctx, rect, heat[team], team, alpha);
+  if (effects.isVisible('heatmap')) {
+    for (const { team, alpha } of teams) {
+      drawHeatmap(ctx, rect, heat[team], team, alpha);
+    }
+  }
+  // Passing network: followed team, visible through the crossfade, and shown
+  // until possession is lost (the streak is broken on the team switch).
+  const netAlpha = Math.max(0, teamBlend);
+  const stillInPossession = possessionTeam === displayTeam;
+  if (effects.isVisible('network') && netAlpha > 0.01 && stillInPossession) {
+    const snap = passingNet.snapshot(8, displayTeam);
+    // Resolve nodes on the live bodies so links move with the players.
+    const livePositions = new Map();
+    for (const p of players) livePositions.set(`${p.team}:${p.shirt}`, { x: p.x, y: p.y });
+    drawPassingNetwork(ctx, toScreen, snap, netAlpha, displayTeam, livePositions);
   }
 
   // Offside line: open play only, for the followed team in possession.
@@ -344,12 +459,16 @@ function drawOverlays(players, possessionTeam, setPieceActive, dt, ball) {
   offsideAlpha += ((showOffside ? 1 : 0) - offsideAlpha) *
     (1 - Math.exp(-dt / OFFSIDE_FADE_TAU));
   if (!showOffside && offsideAlpha < 0.01) offsideAlpha = 0;
-  if (offsideAlpha > 0.01) {
+  if (effects.isVisible('offside') && offsideAlpha > 0.01) {
     drawOffsideLine(ctx, toScreen, offsideX, offsideAlpha, OFFSET_Y, OFFSET_Y + PITCH_PX_H);
   }
 
-  for (const { team, alpha } of teams) {
-    drawAnalysis(ctx, toScreen, players, team, alpha, ball, possessionTeam);
+  if (effects.isVisible('analysis')) {
+    for (const { team, alpha } of teams) {
+      // The animated passing lanes + vision cone replace the static thread and
+      // triangle, so the analysis layer stays legible.
+      drawAnalysis(ctx, toScreen, players, team, alpha, ball, possessionTeam, { links: false });
+    }
   }
 }
 
@@ -430,6 +549,22 @@ function startEngine(xml) {
   fx.reset();
   momentum.reset();
   passingNet.reset();
+  passingLanes.reset();
+  attackChannelsFx.reset();
+  playerHeat.reset();
+  chosenPlayerShirt = null;
+  playerHeatTimer = 0;
+  lastPlayerHeatTeam = -1;
+  lastPlayerHeatSample = -Infinity;
+  lastLaneCompute = -Infinity;
+  lastLaneData = [];
+  lastChannelCompute = -Infinity;
+  lastChannelData = [];
+  playerVelocity.clear();
+  visionAlpha = 0;
+  lastVisionCarrier = '';
+  lastVisionCone = null;
+  visionFocus = null;
   if (highlighter) { highlighter.buffer.length = 0; }
   lastPasser[0] = { id: '', pos: null };
   lastPasser[1] = { id: '', pos: null };
@@ -625,6 +760,7 @@ async function fetchDefaultXml() {
 
 // ── Render ─────────────────────────────────────────────────────
 function render(dt = 0) {
+  if (effects.update(dt)) syncEffectButtons();
   drawPitch();
   drawGoals();
   if (!engine) return;
@@ -643,6 +779,7 @@ function render(dt = 0) {
     const p = {
       x: buffer[o],
       y: buffer[o + 1],
+      heading: buffer[o + 3],
       team: buffer[o + 4],
       shirt: buffer[o + 5],
       role: ROLE.UNKNOWN,
@@ -654,6 +791,31 @@ function render(dt = 0) {
       } catch { /* ignore */ }
     }
     players.push(p);
+  }
+  // Derive velocity from consecutive positions. The buffer carries heading
+  // only, but the pass fan, corridor interception and run channels all need
+  // real vx/vy to predict where bodies will be.
+  const simNow = typeof engine.get_sim_time === 'function' ? engine.get_sim_time() : 0;
+  for (const p of players) {
+    const key = `${p.team}:${p.shirt}`;
+    const prev = playerVelocity.get(key);
+    if (prev && simNow > prev.t + 1e-4) {
+      const dts = simNow - prev.t;
+      p.vx = (p.x - prev.x) / dts;
+      p.vy = (p.y - prev.y) / dts;
+      // A seek or a teleport must not become a 200 m/s sprint.
+      const sp = Math.hypot(p.vx, p.vy);
+      if (sp > 12) {
+        p.vx = (p.vx / sp) * 12;
+        p.vy = (p.vy / sp) * 12;
+      }
+      p.speed = Math.hypot(p.vx, p.vy);
+    } else {
+      p.vx = 0;
+      p.vy = 0;
+      p.speed = 0;
+    }
+    playerVelocity.set(key, { x: p.x, y: p.y, t: simNow });
   }
   const bo = (total - 1) * ENTITY_STRIDE;
   const ball = { x: buffer[bo], y: buffer[bo + 1], z: buffer[bo + 2] };
@@ -718,8 +880,110 @@ function render(dt = 0) {
   updateTeamChip();
   if (typeof engine.get_sim_time === 'function') {
     sampleHeat(overlayPlayers, engine.get_sim_time());
+    samplePlayerHeat(overlayPlayers, engine.get_sim_time());
   }
   drawOverlays(overlayPlayers, possessionTeam, setPieceActive, dt, ball);
+
+  // Live positions for overlays that must stay attached to the players.
+  const liveByKey = new Map();
+  for (const p of overlayPlayers) liveByKey.set(`${p.team}:${p.shirt}`, { x: p.x, y: p.y });
+
+  const attackDir = displayTeam === 0 ? 1 : -1;
+  const carrierTeam = displayTeam;
+  const teamPlayers = overlayPlayers.filter((p) => p.team === carrierTeam);
+  let carrier = null;
+  let bestD = Infinity;
+  for (const p of teamPlayers) {
+    const d = Math.hypot(p.x - ball.x, p.y - ball.y);
+    if (d < bestD) { bestD = d; carrier = p; }
+  }
+  const hasCarrier = carrier && bestD <= 2.5 && !setPieceActive;
+  const overlayDt = playing ? dt : 0;
+
+  // Vision cone: smooth fade in/out and reset when the carrier changes so the
+  // wedge never jumps across the pitch.
+  const carrierKey = hasCarrier ? `${carrierTeam}:${carrier.shirt}` : '';
+  if (carrierKey !== lastVisionCarrier) {
+    lastVisionCarrier = carrierKey;
+    visionAlpha = 0;
+  }
+  visionAlpha += ((hasCarrier ? 1 : 0) - visionAlpha) * (1 - Math.exp(-overlayDt / 0.18));
+  if (hasCarrier) {
+    // Passing options are re-scored at 10 Hz; endpoints resolve live.
+    if (simNow - lastLaneCompute >= 0.1) {
+      lastLaneCompute = simNow;
+      lastLaneData = passingLaneCandidates(overlayPlayers, ball, carrierTeam, attackDir);
+    }
+    // Face the best available pass (not the ball at the carrier's feet), and
+    // ease the focus so the cone never snaps between receivers.
+    let focusTarget = null;
+    let bestP = 0.45;
+    for (const lane of lastLaneData) {
+      if ((lane.p ?? 0) > bestP) {
+        bestP = lane.p ?? 0;
+        const key = lane.player ? `${lane.player.team}:${lane.player.shirt}` : null;
+        focusTarget = (key && liveByKey.get(key)) || lane.to;
+      }
+    }
+    if (focusTarget) {
+      if (!visionFocus) visionFocus = { x: focusTarget.x, y: focusTarget.y };
+      else {
+        const k = 1 - Math.exp(-overlayDt / 0.18);
+        visionFocus.x += (focusTarget.x - visionFocus.x) * k;
+        visionFocus.y += (focusTarget.y - visionFocus.y) * k;
+      }
+    } else {
+      visionFocus = null;
+    }
+    const teammates = teamPlayers.filter((p) => p !== carrier);
+    const opponents = overlayPlayers.filter((p) => p.team !== carrierTeam);
+    lastVisionCone = visionCone(carrier, teammates, opponents, attackDir, visionFocus);
+  } else {
+    lastLaneData = [];
+    visionFocus = null;
+  }
+  if (effects.isVisible('visionCone') && lastVisionCone && visionAlpha > 0.01) {
+    drawVisionCone(ctx, toScreen, lastVisionCone, teamBlend * visionAlpha);
+  }
+
+  // Run channels are re-scored at 10 Hz and anchored to live runners.
+  const ballProgress = ball.x * attackDir;
+  if (!setPieceActive && ballProgress > 15 && possessionTeam === displayTeam) {
+    if (simNow - lastChannelCompute >= 0.1) {
+      lastChannelCompute = simNow;
+      lastChannelData = attackChannels(
+        overlayPlayers,
+        ball,
+        displayTeam,
+        attackDir,
+        overlayPlayers.filter((p) => p.team !== displayTeam),
+      );
+    }
+  } else {
+    lastChannelData = [];
+  }
+
+  // Pausing the sim freezes the transient overlays so an analyst can read
+  // them, while the 10 Hz samplers keep the last geometry.
+  const laneSets = passingLanes.updateLive(overlayDt, lastLaneData, (lane) => {
+    const key = lane.player ? `${lane.player.team}:${lane.player.shirt}` : null;
+    const live = key ? liveByKey.get(key) : null;
+    return {
+      from: { x: ball.x, y: ball.y },
+      to: live ?? lane.to,
+    };
+  });
+  if (effects.isVisible('passingLanes')) {
+    drawPassingLanes(ctx, toScreen, laneSets, teamBlend);
+  }
+  const channelSet = attackChannelsFx.updateLive(overlayDt, lastChannelData, (ch) => {
+    const key = ch.player ? `${ch.player.team}:${ch.player.shirt}` : null;
+    return (key && liveByKey.get(key)) || ch.from;
+  });
+  if (effects.isVisible('attackChannels')) {
+    drawAttackChannels(ctx, toScreen, channelSet, teamBlend);
+  }
+
   if (minimap) minimap.update(performance.now() / 1000);
   if (highlighter) highlighter.update(performance.now() / 1000, engine ? engine.get_sim_time() : 0);
 
@@ -754,23 +1018,25 @@ function render(dt = 0) {
 
     // Soft foot shadow lifts the player off the pitch.
     ctx.beginPath();
-    ctx.ellipse(sx + 1.6, sy + 2.4, 6.4, 3.6, 0, 0, Math.PI * 2);
+    ctx.ellipse(sx + 1.2, sy + 1.8, 4.6, 2.6, 0, 0, Math.PI * 2);
     ctx.fillStyle = 'rgba(0,0,0,0.28)';
     ctx.fill();
 
+    // Player marker: 5 px ≈ 0.54 m radius at this pitch scale, much closer
+    // to a real body than the old 7 px disc.
     ctx.beginPath();
-    ctx.arc(sx, sy, 7, 0, Math.PI * 2);
+    ctx.arc(sx, sy, 5, 0, Math.PI * 2);
     ctx.fillStyle = p.team === 0 ? '#f2f2f2' : '#2f81f7';
     ctx.fill();
     ctx.strokeStyle = 'rgba(0,0,0,0.75)';
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 1.2;
     ctx.stroke();
 
     // GK marker: small gloves ring.
     // (role not in player snapshot here; skip to keep simple)
 
     ctx.fillStyle = p.team === 0 ? '#0d1117' : '#ffffff';
-    ctx.font = 'bold 9px ui-sans-serif, sans-serif';
+    ctx.font = 'bold 8px ui-sans-serif, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(String(p.shirt), sx, sy);
@@ -788,7 +1054,7 @@ function render(dt = 0) {
     ctx.fill();
   }
 
-  const ballRadius = 3.5 + Math.min(bz * 0.8, 4.0);
+  const ballRadius = 2.8 + Math.min(bz * 0.6, 3.0);
   ctx.beginPath();
   ctx.arc(bsx, bsy - bz * 3.0, ballRadius, 0, Math.PI * 2);
   ctx.fillStyle = '#ffea00';
@@ -955,6 +1221,18 @@ function loop(now) {
     requestAnimationFrame(loop);
   }
 }
+for (const button of effectButtons) {
+  button.addEventListener('click', () => {
+    effects.toggleEnabled(button.dataset.effect);
+    syncEffectButtons();
+  });
+}
+if (els.shuffle) {
+  els.shuffle.addEventListener('click', () => {
+    effects.toggleShuffle();
+    syncEffectButtons();
+  });
+}
 els.playpause.addEventListener('click', () => {
   playing = !playing;
   els.playpause.textContent = playing ? '⏸ Pause' : '▶ Play';
@@ -976,8 +1254,8 @@ els.file.addEventListener('change', async (ev) => {
   }
 });
 els.loadpath.addEventListener('click', loadFromPath);
-els.back10.addEventListener('click', () => seekBy(-600));
-els.fwd10.addEventListener('click', () => seekBy(600));
+els.back5.addEventListener('click', () => seekBy(-300));
+els.fwd5.addEventListener('click', () => seekBy(300));
 els.browse.addEventListener('click', browseDirectory);
 
 function seekBy(seconds) {
@@ -998,6 +1276,22 @@ function seekBy(seconds) {
   fx.reset();
   momentum.reset();
   passingNet.reset();
+  passingLanes.reset();
+  attackChannelsFx.reset();
+  playerHeat.reset();
+  chosenPlayerShirt = null;
+  playerHeatTimer = 0;
+  lastPlayerHeatTeam = -1;
+  lastPlayerHeatSample = -Infinity;
+  lastLaneCompute = -Infinity;
+  lastLaneData = [];
+  lastChannelCompute = -Infinity;
+  lastChannelData = [];
+  playerVelocity.clear();
+  visionAlpha = 0;
+  lastVisionCarrier = '';
+  lastVisionCone = null;
+  visionFocus = null;
   if (highlighter) { highlighter.buffer.length = 0; }
   lastPasser[0] = { id: '', pos: null };
   lastPasser[1] = { id: '', pos: null };

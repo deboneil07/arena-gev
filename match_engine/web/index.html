@@ -26,6 +26,28 @@
     }
     button:hover, label.file:hover { background: #30363d; }
     button:disabled { opacity: 0.5; cursor: default; }
+    #effects {
+      display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: center;
+      margin-bottom: 10px;
+    }
+    #effects .effects-label {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+      color: #8b949e; margin-right: 2px;
+    }
+    #effects button {
+      padding: 4px 10px; font-size: 12px; border-radius: 999px; color: #8b949e;
+    }
+    #effects button[aria-pressed="true"] {
+      color: #e6edf3; border-color: #2f81f7; background: rgba(47, 129, 247, 0.16);
+    }
+    #effects button.shuffle-current {
+      color: #ffbe5a; border-color: #ffbe5a; background: rgba(255, 190, 90, 0.12);
+      box-shadow: inset 0 0 0 1px #ffbe5a;
+    }
+    #effects .effect-sep { width: 1px; height: 16px; background: #30363d; margin: 0 2px; }
+    #effects #shuffle-effects[aria-pressed="true"] {
+      border-color: #ffbe5a; color: #ffbe5a; background: rgba(255, 190, 90, 0.12);
+    }
     #analysis-team {
       display: inline-flex; align-items: center; gap: 6px;
       background: #161b22; border: 1px solid #21262d; border-radius: 999px;
@@ -192,9 +214,9 @@
     <span>Ball Alt <strong id="altitude">0.0</strong> m</span>
   </div>
   <div id="controls">
-    <button id="back10">⏪ 10 min</button>
+    <button id="back5">⏪ 5 min</button>
     <button id="playpause">⏸ Pause</button>
-    <button id="fwd10">⏩ 10 min</button>
+    <button id="fwd5">⏩ 5 min</button>
     <button id="restart" disabled>↺ Restart</button>
     <label class="file">📂 Load XML<input type="file" id="file" accept=".xml,text/xml" /></label>
     <label>Speed
@@ -206,6 +228,26 @@
     </label>
     <button id="loadpath">Load path</button>
     <button id="browse" title="Pick a folder and choose an .xml from it">📁 Browse folder</button>
+  </div>
+  <div id="effects" role="group" aria-label="Analytical effects">
+    <span class="effects-label">Effects</span>
+    <button type="button" class="effect-toggle" data-effect="heatmap" aria-pressed="true"
+      title="Cumulative team heatmap">Heatmap</button>
+    <button type="button" class="effect-toggle" data-effect="network" aria-pressed="true"
+      title="Passing network links">Passing network</button>
+    <button type="button" class="effect-toggle" data-effect="offside" aria-pressed="true"
+      title="Offside line">Offside line</button>
+    <button type="button" class="effect-toggle" data-effect="analysis" aria-pressed="true"
+      title="Carrier ring, THREAT arrow/text, press ring and defensive hull">Analysis</button>
+    <button type="button" class="effect-toggle" data-effect="passingLanes" aria-pressed="true"
+      title="Passing lanes to the best receivers">Pass lanes</button>
+    <button type="button" class="effect-toggle" data-effect="attackChannels" aria-pressed="true"
+      title="Forward run channels">Run channels</button>
+    <button type="button" class="effect-toggle" data-effect="visionCone" aria-pressed="true"
+      title="Visible and blind vision sectors">Vision cone</button>
+    <span class="effect-sep" aria-hidden="true"></span>
+    <button type="button" id="shuffle-effects" aria-pressed="false"
+      title="Show one enabled analytical effect at a time">🔀 Shuffle effects</button>
   </div>
   <div id="filelist"></div>
   <div id="status"></div>
@@ -243,9 +285,14 @@
     <span class="legend-sep"></span>
     <span><i class="line-swatch" style="border-top-color:#7ee7ff"></i>Analysis</span>
     <span><i class="line-swatch offside"></i>Offside</span>
+    <span><i class="line-swatch" style="border-top-color:#78dcff"></i>Pass lane · model prob.</span>
+    <span><i class="line-swatch" style="border-top-color:#ffbe5a;border-top-style:dashed"></i>Run channel</span>
+    <span><i class="line-swatch" style="border-top-color:#50dcb4"></i>Vision</span>
+    <span><i class="line-swatch" style="border-top-color:#ff6e6e;border-top-style:dotted"></i>Blind</span>
+    <span><i class="swatch" style="background:#b478ff"></i>Player heat</span>
     <span><i class="heat-swatch"></i>Heat · match so far</span>
   </div>
 
-  <script type="module" src="./app.js?v=12"></script>
+  <script type="module" src="./app.js?v=17"></script>
 </body>
 </html>

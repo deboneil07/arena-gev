@@ -6,8 +6,10 @@ import {
   ANALYSIS,
   applyRoles,
   attackingCandidates,
+  attackChannels,
   backLineStats,
   buildDangerZone,
+  clamp01,
   convexHull,
   corridorClearance,
   crossZone,
@@ -17,6 +19,7 @@ import {
   formationLabel,
   passFan,
   passLaneClear,
+  passingLaneCandidates,
   polygonArea,
   predictPosition,
   selectCoverMarkers,
@@ -27,6 +30,8 @@ import {
   splitUnits,
   threatGrammar,
   unitCentroid,
+  visionCone,
+  visionProfile,
   xtAt,
   xtGain,
 } from './analysis.js';
@@ -554,4 +559,125 @@ test('applyRoles writes the cached roles onto fresh snapshots', () => {
   assert.equal(players[0].role, ROLE.DEF);
   assert.equal(players[1].role, ROLE.FWD);
   assert.equal(players[2].role, ROLE.UNKNOWN);
+});
+
+test('clamp01 treats non-finite input as zero', () => {
+  assert.equal(clamp01(NaN), 0);
+  assert.equal(clamp01(Infinity), 1);
+  assert.equal(clamp01(-Infinity), 0);
+  assert.equal(clamp01(0.4), 0.4);
+});
+
+test('visionCone classifies visible and blind teammates inside its radius', () => {
+  const cone = visionCone(
+    { x: 0, y: 0, heading: 0 },
+    [
+      { x: 8, y: 1, shirt: 8 },   // inside the cone
+      { x: -8, y: 1, shirt: 9 },  // behind the player
+      { x: 30, y: 0, shirt: 10 }, // beyond the 22 m radius
+    ],
+    [],
+    1,
+  );
+  assert.equal(cone.visible.length, 1);
+  assert.equal(cone.visible[0].shirt, 8);
+  // The 30 m teammate is outside the vision radius and is not linked.
+  assert.equal(cone.blind.length, 1);
+  assert.equal(cone.blind[0].shirt, 9);
+  assert.ok(cone.conePoints.length > 3);
+  assert.ok(cone.blindConePoints.length > 3);
+  assert.ok(cone.coverage > 0 && cone.coverage < 1);
+});
+
+test('vision profiles vary per player and stay deterministic', () => {
+  const a = visionProfile({ team: 0, shirt: 9 });
+  const b = visionProfile({ team: 0, shirt: 4 });
+  const c = visionProfile({ team: 1, shirt: 9 });
+  assert.deepEqual(visionProfile({ team: 0, shirt: 9 }), a);
+  assert.ok(a.radius >= 16 && a.radius <= 28);
+  assert.ok(a.halfAngle >= (48 * Math.PI) / 180);
+  assert.ok(a.halfAngle <= (72 * Math.PI) / 180);
+  assert.ok(a.radius !== b.radius || a.halfAngle !== b.halfAngle);
+  assert.ok(a.radius !== c.radius || a.halfAngle !== c.halfAngle);
+  const cone = visionCone({ x: 0, y: 0, heading: 0, team: 0, shirt: 9 }, [], [], 1);
+  assert.equal(cone.radius, a.radius);
+  assert.equal(cone.halfAngle, a.halfAngle);
+});
+
+test('visionCone treats a teammate behind an opponent as blind', () => {
+  const cone = visionCone(
+    { x: 0, y: 0, heading: 0 },
+    [{ x: 10, y: 0, shirt: 8 }],
+    [{ x: 5, y: 0, shirt: 5 }],
+    1,
+  );
+  assert.equal(cone.visible.length, 0);
+  assert.equal(cone.blind.length, 1);
+});
+
+test('visionCone faces the best passing focus instead of the ball', () => {
+  const cone = visionCone(
+    { x: 0, y: 0, heading: 0, team: 0, shirt: 9 },
+    [{ x: 0, y: -8, shirt: 8 }, { x: 8, y: 0, shirt: 10 }],
+    [],
+    1,
+    { x: 0, y: -12 },
+  );
+  assert.ok(Math.abs(cone.facing + Math.PI / 2) < 1e-9);
+  assert.equal(cone.visible[0].shirt, 8);
+  assert.equal(cone.blind[0].shirt, 10);
+});
+
+test('visionCone falls back to velocity when heading is missing', () => {
+  const cone = visionCone({ x: 0, y: 0, vx: 0, vy: 6 }, [{ x: 0, y: 10 }], [], 1);
+  assert.ok(Math.abs(cone.facing - Math.PI / 2) < 1e-9);
+  assert.equal(cone.visible.length, 1);
+});
+
+test('attackChannels proposes meaningful forward runs', () => {
+  const players = [
+    { x: 20, y: 0, team: 0, role: ROLE.FWD, shirt: 9, speed: 7 },
+    { x: 10, y: -10, team: 0, role: ROLE.MID, shirt: 8, speed: 6 },
+    { x: -20, y: 0, team: 1, role: ROLE.DEF, shirt: 4, speed: 4 },
+    { x: -10, y: 5, team: 1, role: ROLE.DEF, shirt: 5, speed: 4 },
+  ];
+  const channels = attackChannels(players, { x: 16, y: 0 }, 0, 1, players.filter((q) => q.team === 1));
+  assert.ok(channels.length > 0 && channels.length <= 3);
+  for (const ch of channels) {
+    const len = Math.hypot(ch.to.x - ch.from.x, ch.to.y - ch.from.y);
+    assert.ok(len >= 5, `run ${len} should be a real movement arrow`);
+    assert.ok(len <= 13, `run ${len} should stay short and readable`);
+    assert.ok(ch.score >= 0 && ch.score <= 1);
+    assert.ok(Number.isFinite(ch.to.x) && Number.isFinite(ch.to.y));
+  }
+  assert.equal(attackChannels(players, { x: -10, y: 0 }, 0, 1, []).length, 0);
+});
+
+test('attackChannels bows the run away from a defender on the line', () => {
+  const players = [
+    { x: 24, y: 0, team: 0, role: ROLE.FWD, shirt: 9, speed: 7 },
+    { x: 30, y: 0, team: 1, role: ROLE.DEF, shirt: 4, speed: 4 },
+  ];
+  const channels = attackChannels(players, { x: 16, y: 0 }, 0, 1, [players[1]]);
+  assert.equal(channels.length, 1);
+  assert.ok(Math.abs(channels[0].curve) > 1, 'the bowed route avoids the defender');
+  assert.ok(Math.abs(channels[0].curve) <= 4);
+  const len = Math.hypot(
+    channels[0].to.x - channels[0].from.x,
+    channels[0].to.y - channels[0].from.y,
+  );
+  assert.ok(len >= 5 && len <= 13);
+});
+
+test('passingLaneCandidates returns scored lanes from the carrier', () => {
+  const players = [
+    { x: 0, y: 0, team: 0, role: ROLE.MID, shirt: 6, vx: 0, vy: 0 },
+    { x: 15, y: 0, team: 0, role: ROLE.FWD, shirt: 9, vx: 0, vy: 0 },
+    { x: 0, y: 20, team: 1, role: ROLE.DEF, shirt: 4, vx: 0, vy: 0 },
+  ];
+  const lanes = passingLaneCandidates(players, { x: 0.5, y: 0 }, 0, 1);
+  assert.equal(lanes.length, 1);
+  assert.equal(lanes[0].player.shirt, 9);
+  assert.ok(lanes[0].p >= 0 && lanes[0].p <= 1);
+  assert.ok(Number.isFinite(lanes[0].clearance));
 });

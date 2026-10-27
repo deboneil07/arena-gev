@@ -49,3 +49,24 @@ test('passing network snapshots filter to a single team on request', () => {
   assert.equal(all.nodes.length, 4);
   assert.equal(all.links.length, 2);
 });
+
+test('breakRetention ends the retained sequence but keeps accumulated stats', () => {
+  const net = createPassingNetwork();
+  const p = (x, y, shirt) => ({ x, y, team: 0, shirt });
+  for (let i = 0; i < 3; i++) net.observePass(p(0, 0, 9), p(10, 0, 8));
+  assert.equal(net.retention, 3);
+  const before = net.snapshot(8, 0);
+  assert.equal(before.nodes.length, 2);
+  assert.equal(before.streak, 3);
+
+  net.breakRetention();
+  assert.equal(net.retention, 0);
+  const after = net.snapshot(8, 0);
+  assert.equal(after.streak, 0);
+  assert.equal(after.nodes.length, before.nodes.length);
+  assert.equal(after.links[0].n, before.links[0].n);
+
+  // A new pass sequence starts from one.
+  net.observePass(p(0, 0, 9), p(10, 0, 8));
+  assert.equal(net.retention, 1);
+});

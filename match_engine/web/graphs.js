@@ -60,6 +60,8 @@ export function rowValue(type, label) {
 export function createPassingNetwork() {
   const touches = new Map(); // key team:shirt -> {x,y,n}
   const links = new Map(); // key from>to -> n
+  let lastTeam = null;
+  let streak = 0;
 
   function addTouch(p) {
     const k = `${p.team}:${p.shirt}`;
@@ -78,6 +80,14 @@ export function createPassingNetwork() {
     addTouch(to);
     const lk = `${from.team}:${from.shirt}>${to.team}:${to.shirt}`;
     links.set(lk, (links.get(lk) ?? 0) + 1);
+    // Retention: consecutive passes by the same team build the streak.
+    if (from.team === to.team) {
+      if (lastTeam === from.team) streak += 1;
+      else { lastTeam = from.team; streak = 1; }
+    } else {
+      lastTeam = null;
+      streak = 0;
+    }
   }
 
   function snapshot(topLinks = 5, team = null) {
@@ -109,15 +119,30 @@ export function createPassingNetwork() {
       links: top,
       maxTouches: nodes.reduce((m, n) => Math.max(m, n.n), 0),
       maxLink: top.reduce((m, l) => Math.max(m, l.n), 0),
+      streak,
     };
+  }
+
+  /** Interception / turnover: stop counting the retained sequence, keep stats. */
+  function breakRetention() {
+    lastTeam = null;
+    streak = 0;
   }
 
   function reset() {
     touches.clear();
     links.clear();
+    lastTeam = null;
+    streak = 0;
   }
 
-  return { observePass, snapshot, reset };
+  return {
+    observePass,
+    snapshot,
+    breakRetention,
+    reset,
+    get retention() { return streak; },
+  };
 }
 
 export { shotXg, xtAt, xtGain };

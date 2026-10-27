@@ -28,14 +28,16 @@ on `:8000`. Open <http://localhost:8000/web/>.
 
 The left-hand **Matches** panel lists every bundled fixture — scroll the
 list and click a match to load and watch it. The controls give you
-pause/play, restart, a 0.25×–8× speed slider, ±10 minute seek, and a
+pause/play, restart, a 0.25×–8× speed slider, ±5 minute seek, and a
 path box to load any XML by path (or use the **Load XML** dialog).
 
 The viewer overlays broadcast-style analysis: a light cumulative heatmap,
 ball-carrier highlight, a dashed thread, an attacking triangle, a faint
 attack arrow in the final third, a translucent defensive hull when out of
 possession, a pressing trigger, and an offside line (open play only). The
-overlays follow possession and fade during set pieces.
+overlays follow possession and fade during set pieces. Each analytical layer
+has a toggle in the effects bar; **Shuffle effects** cycles one enabled layer
+at a time.
 
 ## Deploy to Render
 
@@ -60,6 +62,6 @@ render apply --file render.yaml
 ```
 cd match_engine
 cargo test
-node --test web/analysis.test.mjs
+node --test web/*.test.mjs
 node web/smoke_test.cjs          # requires the Node wasm bindings (see web/README.md)
 ```

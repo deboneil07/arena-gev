@@ -101,6 +101,22 @@ impl TacticalBrain {
         self.commitment_timer -= dt;
         self.scan_timer -= dt;
 
+        // Goalkeepers do not chase outfield feed events. Keep them anchored to
+        // their goal; the engine stages the logged action at its own origin.
+        let mut upcoming_event = upcoming_event;
+        if role == PlayerRole::Goalkeeper {
+            if let Some((target, _)) = upcoming_event {
+                let own_goal_x = if plan.ctx.is_home {
+                    -crate::parser::PITCH_HALF_LENGTH
+                } else {
+                    crate::parser::PITCH_HALF_LENGTH
+                };
+                if (target.x - own_goal_x).abs() > 22.0 {
+                    upcoming_event = None;
+                }
+            }
+        }
+
         // ── 1. HARD CONSTRAINT — a scheduled event must be reached in time. ──
         if let Some((event_target, time_until)) = upcoming_event {
             let dist = pos.distance(event_target);

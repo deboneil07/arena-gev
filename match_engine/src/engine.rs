@@ -403,6 +403,10 @@ pub struct SimulationEngine {
     pub possession_frames: [u64; 2],
     /// Active set piece (corner / kick-off / free kick / throw-in), if any.
     set_piece: Option<SetPiece>,
+    /// A synthetic corner delivery when the feed awards a corner but omits the
+    /// delivery pass: (deliver_at, team, side). Keeps the corner shape honest
+    /// instead of holding the box while the ball drifts to the next event.
+    synthetic_corner: Option<(f32, String, f32)>,
     /// A kick-off waiting for the goal celebration to finish: (team, at_time).
     pending_kickoff: Option<(String, f32)>,
     /// Explicit rate-limited line positions per team: `[home, away]`.
@@ -577,7 +581,8 @@ impl SimulationEngine {
             event_lookup.insert(e.id, (Vector2::new(e.origin_x, e.origin_y), e.match_time_secs));
         }
         let timeline = Timeline::from_events(ctx.events.clone());
-        let dispatcher = LookaheadDispatcher::new(ctx.events, config.lookahead_secs);
+        let mut dispatcher = LookaheadDispatcher::new(ctx.events, config.lookahead_secs);
+        dispatcher.set_home_team(ctx.home_team_id.clone());
 
         let home_dir = ctx
             .directions
@@ -754,6 +759,7 @@ impl SimulationEngine {
             score: [0, 0],
             possession_frames: [0, 0],
             set_piece: initial_set_piece,
+            synthetic_corner: None,
             pending_kickoff: None,
             blocks,
             phases: [PhaseTracker::new(); 2],
@@ -1179,6 +1185,18 @@ impl SimulationEngine {
             self.staging_decision = "kickoff pending";
             return;
         }
+        // A corner keeps the ball on the flag until it is actually taken.
+        // Without this the box can fill while the ball rolls to an unrelated
+        // event ten seconds away. Other restarts are already at the spot and
+        // must still be allowed to stage for the next event.
+        if self
+            .set_piece
+            .as_ref()
+            .is_some_and(|sp| sp.kind == SetPieceKind::Corner)
+        {
+            self.staging_decision = "corner holds ball";
+            return;
+        }
         let Some((event_time, spot, next_player)) = self.next_ball_event() else {
             self.staging_decision = "no ball event";
             return;
@@ -1330,19 +1348,41 @@ impl SimulationEngine {
                 if action.origin.x >= 0.0 { 52.0 } else { -52.0 },
                 if action.origin.y >= 0.0 { 33.5 } else { -33.5 },
             );
-            let (taker_id, flag) = match self.next_restart_actor(&team, canonical, 14.0, None) {
-                Some((id, origin)) => (Some(id), origin),
-                None => (self.nearest_taker(&team, canonical), canonical),
-            };
+            let side = if action.origin.y >= 0.0 { 1.0 } else { -1.0 };
+            // A real feed follows the award with a delivery pass near the
+            // flag. If it does not, synthesize one so the corner is not a box
+            // full of players watching the ball drift to midfield.
+            let (taker_id, flag, synthetic_at) =
+                match self.next_restart_actor(&team, canonical, 14.0, None) {
+                    Some((id, origin)) => (Some(id), origin, None),
+                    None => {
+                        // Time the synthetic cross so the box fills and the
+                        // ball is back in play before the next feed event.
+                        let setup = self
+                            .next_ball_event()
+                            .map(|(t, _, _)| ((t - self.sim_time) * 0.55).clamp(4.0, 10.0))
+                            .unwrap_or(14.0);
+                        (
+                            self.nearest_taker(&team, canonical),
+                            canonical,
+                            Some(self.sim_time + setup),
+                        )
+                    }
+                };
             self.bring_ball_to(flag);
+            let until = match synthetic_at {
+                Some(at) => (at + 3.0).min(self.sim_time + 20.0),
+                None => self.restart_until(20.0),
+            };
             self.set_piece = Some(SetPiece {
                 kind: SetPieceKind::Corner,
-                team,
-                until: self.restart_until(20.0),
+                team: team.clone(),
+                until,
                 spot: flag,
-                side: if action.origin.y >= 0.0 { 1.0 } else { -1.0 },
+                side,
                 taker_id,
             });
+            self.synthetic_corner = synthetic_at.map(|at| (at, team, side));
             return;
         }
         // Other dead-ball restarts (out) and fouls: bring the ball to the spot.
@@ -1432,8 +1472,46 @@ impl SimulationEngine {
         let Some(idx) = self.agent_index(&action.player_id) else {
             return;
         };
-        let pos = self.agents[idx].position;
-        let heading = self.agents[idx].heading;
+        // A goalkeeper named on an outfield event is a feed artefact. Keep
+        // him on his line and bind the ball to the nearest outfield teammate
+        // at the logged origin, so the ball never follows the keeper's body.
+        let own_goal_x = if action.team_id == self.home_team_id {
+            -PITCH_HALF_LENGTH
+        } else {
+            PITCH_HALF_LENGTH
+        };
+        let keeper_outfield =
+            self.agents[idx].is_goalkeeper && (action.origin.x - own_goal_x).abs() > 22.0;
+        let (attach_id, pos, heading) = if keeper_outfield {
+            let nearest = self
+                .agents
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| {
+                    a.team_id == action.team_id && !a.is_goalkeeper && !a.sent_off
+                })
+                .map(|(j, a)| (j, a.position.distance(action.origin)))
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(j, _)| j);
+            match nearest {
+                Some(j) => (
+                    self.agents[j].id.clone(),
+                    self.agents[j].position,
+                    self.agents[j].heading,
+                ),
+                None => (
+                    action.player_id.clone(),
+                    action.origin,
+                    self.agents[idx].heading,
+                ),
+            }
+        } else {
+            (
+                action.player_id.clone(),
+                self.agents[idx].position,
+                self.agents[idx].heading,
+            )
+        };
 
         // ═══════════════════════════════════════════════════════════════════
         // OPTA FIDELITY: the event says player X at position Y does this
@@ -1444,7 +1522,7 @@ impl SimulationEngine {
         // This is what stops a pass from appearing to come from thin air —
         // the "home team passes in the log but away looks like they're
         // passing" bug.
-        self.ball.attach_to(action.player_id.clone(), pos, heading);
+        self.ball.attach_to(attach_id, pos, heading);
 
         if let Some(target) = action.target {
             // Pass / shot / clearance with a known destination.
@@ -1879,6 +1957,30 @@ impl SimulationEngine {
     /// kick-off. Period boundaries are handled *before* dispatch in
     /// [`Self::prepare_period_restart`].
     fn update_set_piece(&mut self) {
+        // Fire a synthesized corner delivery when the feed omitted one.
+        if let Some((at, team, side)) = self.synthetic_corner.clone() {
+            let active = self
+                .set_piece
+                .as_ref()
+                .is_some_and(|sp| sp.kind == SetPieceKind::Corner && sp.team == team);
+            if !active {
+                self.synthetic_corner = None;
+            } else if self.sim_time >= at {
+                let dir = if team == self.home_team_id { 1.0 } else { -1.0 };
+                let target = Vector2::new(dir * 46.0, -side * 4.0).clamp_on_pitch();
+                self.ball.launch_for_kind(
+                    target,
+                    crate::parser::PassKind::CornerTaken,
+                    -side * 2.0,
+                    true,
+                );
+                self.pending_landing = Some((target, None));
+                if let Some(sp) = &mut self.set_piece {
+                    sp.until = (self.sim_time + 2.5).min(sp.until);
+                }
+                self.synthetic_corner = None;
+            }
+        }
         if self
             .set_piece
             .as_ref()
@@ -2112,6 +2214,13 @@ impl SimulationEngine {
         let Some(idx) = self.agent_index.get(old_id).copied() else {
             return;
         };
+        // Defensive: a synthetic feed can name the same player on multiple
+        // "on" rows. Never let a second body with the same id appear — the
+        // duplicated agents would share one anchor and tear the shape apart
+        // (notably the goalkeeper).
+        if self.agent_index.contains_key(new_id) {
+            return;
+        }
         let pos = self.agents[idx].position;
         let old_role = self.agents[idx].role;
         let anchor = self.anchor_buffer.remove(old_id).unwrap_or(pos);
@@ -2405,6 +2514,14 @@ fn next_restart_actor(
         .take_while(|e| e.match_time_secs - self.sim_time <= 25.0)
         .filter(|e| e.team_id == team && !e.player_id.is_empty() && is_ball_event(e.type_id))
         .filter(|e| exclude.map(|x| x != e.player_id).unwrap_or(true))
+        // Goalkeepers never take corners/free kicks/throw-ins in this model.
+        // (Goal kicks place the keeper explicitly in `position_goal_kick`.)
+        .filter(|e| {
+            self.agent_index
+                .get(&e.player_id)
+                .map(|&i| !self.agents[i].is_goalkeeper)
+                .unwrap_or(true)
+        })
         .map(|e| (e.player_id.clone(), Vector2::new(e.origin_x, e.origin_y)))
         .find(|(_, p)| p.distance(near) <= radius)
 }
@@ -2414,7 +2531,11 @@ fn next_restart_actor(
 fn resolve_taker(&self, sp: &SetPiece) -> Option<String> {
     sp.taker_id
         .as_deref()
-        .filter(|id| self.agent_index.get(*id).is_some_and(|&i| !self.agents[i].sent_off))
+        .filter(|id| {
+            self.agent_index
+                .get(*id)
+                .is_some_and(|&i| !self.agents[i].sent_off && !self.agents[i].is_goalkeeper)
+        })
         .map(str::to_string)
         .or_else(|| self.nearest_taker(&sp.team, sp.spot))
 }
@@ -4065,7 +4186,9 @@ mod engine_tests {
         let mut ctx = context();
         ctx.events = vec![typed_event(1, 1.0, 6, "home", 50.0, 20.0)];
         let mut e = SimulationEngine::new(ctx);
-        e.run_for(12.0);
+        // With no following feed event the synthetic delivery waits 14 s, so
+        // inspect the settled shape just before it is taken.
+        e.run_for(13.5);
         assert!(e.set_piece_active(), "corner set piece not active");
         assert!(
             (e.ball.position.x - 52.0).abs() < 1.5 && (e.ball.position.y - 33.5).abs() < 1.5,

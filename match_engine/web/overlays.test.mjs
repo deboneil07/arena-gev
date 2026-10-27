@@ -6,8 +6,11 @@ import { createPassingNetwork } from './graphs.js';
 import { createHeatmap } from './heatmap.js';
 import {
   drawAnalysis,
+  drawAttackChannels,
   drawHeatmap,
   drawOffsideLine,
+  drawPassingLanes,
+  drawPassingNetwork,
 } from './overlays.js';
 
 function makeCtx() {
@@ -94,5 +97,41 @@ test('drawOffsideLine is a dashed line only for a finite x and visible alpha', (
   const before = calls.length;
   drawOffsideLine(ctx, toScreen, NaN, 1, 40, 620);
   drawOffsideLine(ctx, toScreen, -12, 0, 40, 620);
+  assert.equal(calls.length, before);
+});
+
+test('drawPassingNetwork anchors links and nodes to live player positions', () => {
+  const { ctx, calls } = makeCtx();
+  const net = createPassingNetwork();
+  for (let i = 0; i < 3; i++) {
+    net.observePass({ x: 0, y: 0, team: 0, shirt: 9 }, { x: 10, y: 0, team: 0, shirt: 8 });
+  }
+  const snap = net.snapshot(8, 0);
+  const live = new Map([
+    ['0:9', { x: 20, y: 5 }],
+    ['0:8', { x: 30, y: 5 }],
+  ]);
+  drawPassingNetwork(ctx, toScreen, snap, 1, 0, live);
+  const a = toScreen(20, 5);
+  const b = toScreen(30, 5);
+  assert.ok(calls.some(([n, x, y]) => n === 'moveTo' && Math.abs(x - a[0]) < 1e-6 && Math.abs(y - a[1]) < 1e-6));
+  assert.ok(calls.some(([n, x, y]) => n === 'lineTo' && Math.abs(x - b[0]) < 1e-6 && Math.abs(y - b[1]) < 1e-6));
+});
+
+test('drawPassingLanes and drawAttackChannels draw live arrows', () => {
+  const { ctx, calls } = makeCtx();
+  drawPassingLanes(ctx, toScreen, [{
+    from: { x: 0, y: 0 }, to: { x: 12, y: 4 }, growth: 1, alpha: 1, blur: 0, p: 0.8,
+  }], 1);
+  assert.ok(calls.some(([n]) => n === 'lineTo'));
+  drawAttackChannels(ctx, toScreen, [{
+    from: { x: 20, y: 0 }, to: { x: 34, y: -4 }, growth: 1, alpha: 1, blur: 0,
+    score: 0.9, curve: 2,
+  }], 1);
+  assert.ok(calls.some(([n]) => n === 'quadraticCurveTo'));
+  // No-op for empty or invisible input.
+  const before = calls.length;
+  drawPassingLanes(ctx, toScreen, [], 1);
+  drawAttackChannels(ctx, toScreen, [], 1);
   assert.equal(calls.length, before);
 });

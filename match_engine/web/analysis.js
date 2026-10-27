@@ -83,6 +83,7 @@ const SHAPE_LABELS = Object.freeze({
 });
 
 export function clamp01(value) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 0;
   return Math.min(1, Math.max(0, value));
 }
 
@@ -572,6 +573,7 @@ export function isOnBall(threat, ball, radius = 2.5) {
 // never presented as measured xT. Calibrate the peak/edges against the
 // bundled event corpus (Brier/log-loss on next-goal labels).
 export function xtAt(x, y, dir) {
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(dir)) return 0;
   const px = x * dir; // progress toward the attacked goal
   const goalDist = Math.hypot(52.5 - px, y);
   const proximity = clamp01(1 - goalDist / 60);
@@ -587,6 +589,7 @@ export function xtGain(from, to, dir) {
 
 /** Shot value heuristic (0.02–0.65) by distance/angle — a model estimate. */
 export function shotXg(x, y, dir) {
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(dir)) return 0.02;
   const px = x * dir;
   const d = Math.hypot(52.5 - px, y);
   if (d > 35) return 0.02;
@@ -597,15 +600,19 @@ export function shotXg(x, y, dir) {
 
 /** Predict a player's position `dt` seconds ahead from velocity. */
 export function predictPosition(p, dt) {
+  if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) return { x: 0, y: 0 };
+  const step = Number.isFinite(dt) ? dt : 0;
   return {
-    x: p.x + (p.vx || 0) * dt,
-    y: p.y + (p.vy || 0) * dt,
+    x: p.x + (p.vx || 0) * step,
+    y: p.y + (p.vy || 0) * step,
   };
 }
 
 /** Stop-to-stop time for `dist` metres at caps (mirrors the engine). */
 export function arrivalTime(dist, maxSpeed = 8.0, maxAccel = 6.0) {
-  if (dist <= 0) return 0;
+  if (!Number.isFinite(dist) || dist <= 0) return 0;
+  if (!Number.isFinite(maxSpeed) || maxSpeed <= 0) maxSpeed = 8.0;
+  if (!Number.isFinite(maxAccel) || maxAccel <= 0) maxAccel = 6.0;
   const dAccel = (maxSpeed * maxSpeed) / (2 * maxAccel);
   if (dist <= 2 * dAccel) return 2 * Math.sqrt(dist / maxAccel);
   return (2 * maxSpeed) / maxAccel + (dist - 2 * dAccel) / maxSpeed;
@@ -629,10 +636,25 @@ export function passFan(ball, candidates, opponents, dir) {
     if (!beats) continue;
     const control = clamp01(1.2 - dist / 45);
     const value = xtGain(ball, reception, dir);
-    const p = clamp01(
-      clamp01(clearance / 6) * 0.55 + control * 0.25 + clamp01(0.5 + value * 4) * 0.2,
-    );
-    scored.push({ from: { ...ball }, to: reception, player: c, p, clearance, value });
+    // Nearest opponent to the reception point: pressure lowers completion.
+    let receiverPressure = 12;
+    for (const o of opponents ?? []) {
+      if (!o || !Number.isFinite(o.x) || !Number.isFinite(o.y)) continue;
+      receiverPressure = Math.min(receiverPressure, Math.hypot(o.x - reception.x, o.y - reception.y));
+    }
+    const pressureScore = clamp01(receiverPressure / 6);
+    // Logistic completion probability: clearance carries the most weight,
+    // then control, receiver pressure and the value of the space gained.
+    // The distance term keeps a 50 m switch below a short, clean ball.
+    const logit =
+      -1.2 +
+      1.9 * clamp01(clearance / 6) +
+      1.3 * control +
+      0.8 * pressureScore +
+      0.6 * clamp01(0.5 + value * 4) -
+      0.03 * dist;
+    const p = clamp01(1 / (1 + Math.exp(-logit)));
+    scored.push({ from: { ...ball }, to: reception, player: c, p, clearance, value, pressure: receiverPressure });
   }
   scored.sort((a, b) => b.p - a.p);
   return scored.slice(0, ANALYSIS.fanMaxOptions);
@@ -781,6 +803,263 @@ export function splitUnits(teamPlayers, dir = 1) {
   }
   for (const key of ['def', 'mid', 'fwd']) units[key].sort((a, b) => b.y - a.y);
   return units;
+}
+
+/**
+ * Candidate receivers for the passing-lane overlay: teammates (excluding the
+ * carrier) within the pass range, best-first by passFan score. Pure helper so
+ * the renderer and tests share one definition.
+ */
+export function passingLaneCandidates(players, ball, team, dir) {
+  if (!players?.length || !ball) return [];
+  const teamPlayers = players.filter((p) => p.team === team);
+  if (teamPlayers.length === 0) return [];
+  // Carrier = nearest teammate to the ball.
+  let carrier = null;
+  let bestD = Infinity;
+  for (const p of teamPlayers) {
+    const d = Math.hypot(p.x - ball.x, p.y - ball.y);
+    if (d < bestD) { bestD = d; carrier = p; }
+  }
+  if (!carrier || bestD > 2.5) return [];
+  const candidates = teamPlayers.filter((p) => p !== carrier);
+  return passFan(ball, candidates, players.filter((p) => p.team !== team), dir);
+}
+
+/**
+ * Perpendicular bow (metres) for a run channel, curving away from the closest
+ * defender on the straight line. Zero when the lane is already clean.
+ */
+function runCurveOffset(from, to, opponents) {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-6) return 0;
+  const nx = -dy / len;
+  const ny = dx / len;
+  const mx = (from.x + to.x) / 2;
+  const my = (from.y + to.y) / 2;
+  let nearest = null;
+  let nearestD = Infinity;
+  for (const o of opponents ?? []) {
+    if (!o || !Number.isFinite(o.x) || !Number.isFinite(o.y)) continue;
+    const d = pointSegmentDistance(o, from, to);
+    if (d < nearestD) {
+      nearestD = d;
+      nearest = o;
+    }
+  }
+  if (!nearest || nearestD > 9) return 0;
+  // Which side of the line is the defender on?
+  const side = (nearest.x - mx) * nx + (nearest.y - my) * ny;
+  const sign = side >= 0 ? -1 : 1;
+  // Keep the bow readable: never more than ~22% of the run length.
+  const amount = Math.min(len * 0.22, Math.max(1.0, (9 - nearestD) * 0.55));
+  return sign * amount;
+}
+
+/**
+ * Attack channels: probable runs forwards SHOULD make during a counter.
+ * Returns [{ from:{x,y}, to:{x,y}, player, score, curve }].
+ */
+export function attackChannels(players, ball, team, dir, opponents) {
+  if (!players?.length || !ball) return [];
+  const teamPlayers = players.filter((p) => p.team === team);
+  if (teamPlayers.length === 0) return [];
+  const progress = ball.x * dir;
+  if (progress < 15) return [];
+  const opps = opponents ?? players.filter((p) => p.team !== team);
+  const goal = { x: dir * 52.5, y: 0 };
+  const forwards = teamPlayers.filter(
+    (p) => (p.role === ROLE.FWD || p.role === ROLE.MID) && distance(p, ball) > 2.5,
+  );
+  const advanced = forwards.filter((p) => p.x * dir > progress - 5);
+  const targets = advanced.length
+    ? advanced
+    : forwards.slice().sort((a, b) => b.x * dir - a.x * dir).slice(0, 3);
+  const out = [];
+
+  for (const p of targets) {
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+    const baseValue = xtAt(p.x, p.y, dir);
+    const goalAngle = Math.atan2(goal.y - p.y, goal.x - p.x);
+    const speed = Number.isFinite(p.speed) && p.speed > 1 ? p.speed : 7;
+    let best = null;
+
+    // Sample short, readable run endpoints: 6/9/12 m ahead, fanned 20°
+    // around the goal vector. Score by xT gain and the time the runner gains
+    // on the nearest defender.
+    for (const radius of [6, 9, 12]) {
+      for (const da of [-0.35, -0.175, 0, 0.175, 0.35]) {
+        const ang = goalAngle + da;
+        let ex = p.x + Math.cos(ang) * radius;
+        let ey = p.y + Math.sin(ang) * radius;
+        ex = Math.max(-52.5, Math.min(52.5, ex));
+        ey = Math.max(-34, Math.min(34, ey));
+        const gain = xtAt(ex, ey, dir) - baseValue;
+        if (gain <= 0) continue;
+
+        const runT = arrivalTime(Math.hypot(ex - p.x, ey - p.y), speed, 5.5);
+        let defT = Infinity;
+        for (const o of opps) {
+          if (!o || !Number.isFinite(o.x) || !Number.isFinite(o.y)) continue;
+          const oSpeed = Math.hypot(o.vx || 0, o.vy || 0);
+          defT = Math.min(defT, arrivalTime(distance(o, { x: ex, y: ey }), Math.max(4, oSpeed + 2), 6));
+        }
+        const margin = Number.isFinite(defT) ? defT - runT : 3;
+        const laneClear = passLaneClear(ball, { x: ex, y: ey }, opps, 2.5) ? 1 : 0;
+        const score = clamp01(
+          0.55 * clamp01(gain * 4) +
+          0.35 * clamp01(margin / 2) +
+          0.10 * laneClear,
+        );
+        if (!best || score > best.score) {
+          best = { x: ex, y: ey, score, gain, margin };
+        }
+      }
+    }
+
+    if (!best) continue;
+    out.push({
+      from: { x: p.x, y: p.y },
+      to: { x: best.x, y: best.y },
+      player: p,
+      score: best.score,
+      gain: best.gain,
+      margin: best.margin,
+      curve: runCurveOffset({ x: p.x, y: p.y }, { x: best.x, y: best.y }, opps),
+    });
+  }
+
+  out.sort((a, b) => b.score - a.score);
+  return out.slice(0, 3);
+}
+
+/** Stable per-player hash (team + shirt), no engine id needed. */
+function playerHash(player) {
+  const key = `${player?.team ?? 0}:${player?.shirt ?? 0}`;
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  // Final avalanche so the low and high bit fields are independent.
+  h ^= h >>> 16;
+  h = Math.imul(h, 2246822507);
+  h ^= h >>> 13;
+  h = Math.imul(h, 3266489909);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+/**
+ * Individual vision profile. Every player gets a stable radius (16–28 m) and
+ * half-angle (48–72°), so a narrow full-back and a wide-vision playmaker do
+ * not share the same cone. Deterministic: same player, same profile.
+ */
+export function visionProfile(player) {
+  const h = playerHash(player);
+  const radius = 16 + ((h & 0x3ff) / 0x3ff) * 12;
+  const halfAngle = ((48 + ((h >>> 10) & 0x3ff) / 0x3ff * 24) * Math.PI) / 180;
+  return { radius, halfAngle };
+}
+
+/**
+ * Vision cone geometry for a player: facing direction, cone sector, and
+ * classification of teammates into visible (inside cone) vs blind (outside).
+ */
+export function visionCone(player, teammates, opponents, dir, focus = null) {
+  const profile = visionProfile(player ?? {});
+  if (!player || !Number.isFinite(player.x) || !Number.isFinite(player.y)) {
+    return {
+      apex: null,
+      facing: 0,
+      halfAngle: profile.halfAngle,
+      radius: profile.radius,
+      conePoints: [],
+      blindConePoints: [],
+      visible: [],
+      blind: [],
+      coverage: 0,
+    };
+  }
+  let facing = 0;
+  // The analytical focus (the best passing option) wins over the raw engine
+  // heading: players should look where the next pass is going, not at the
+  // ball at their feet.
+  if (
+    focus &&
+    Number.isFinite(focus.x) &&
+    Number.isFinite(focus.y) &&
+    Math.hypot(focus.x - player.x, focus.y - player.y) > 1.0
+  ) {
+    facing = Math.atan2(focus.y - player.y, focus.x - player.x);
+  } else if (Number.isFinite(player.heading) && Math.abs(player.heading) > 1e-6) {
+    facing = player.heading;
+  } else if (Math.hypot(player.vx || 0, player.vy || 0) > 0.2) {
+    facing = Math.atan2(player.vy || 0, player.vx || 0);
+  } else {
+    facing = dir > 0 ? 0 : Math.PI;
+  }
+  const { halfAngle, radius } = profile;
+  const segs = 12;
+  const conePoints = [{ x: player.x, y: player.y }];
+  for (let i = 0; i <= segs; i++) {
+    const a = facing - halfAngle + (2 * halfAngle * i) / segs;
+    conePoints.push({ x: player.x + Math.cos(a) * radius, y: player.y + Math.sin(a) * radius });
+  }
+  conePoints.push({ x: player.x, y: player.y });
+  // Blind sector = rest of the circle behind/around the cone.
+  const blindConePoints = [{ x: player.x, y: player.y }];
+  const startA = facing + halfAngle;
+  const blindSweep = 2 * Math.PI - 2 * halfAngle;
+  for (let i = 0; i <= 16; i++) {
+    const a = startA + (blindSweep * i) / 16;
+    blindConePoints.push({ x: player.x + Math.cos(a) * radius, y: player.y + Math.sin(a) * radius });
+  }
+  blindConePoints.push({ x: player.x, y: player.y });
+  const inCone = (q) => {
+    if (!q || q === player) return false;
+    const dx = q.x - player.x;
+    const dy = q.y - player.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 1e-6 || d > radius) return false;
+    let ang = Math.atan2(dy, dx);
+    let diff = ang - facing;
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    return Math.abs(diff) <= halfAngle;
+  };
+  // A teammate behind a defender on the sightline is not actually visible.
+  const occluded = (q) => {
+    for (const o of opponents ?? []) {
+      if (!o || !Number.isFinite(o.x) || !Number.isFinite(o.y)) continue;
+      if (pointSegmentDistance(o, player, q) < 1.2) return true;
+    }
+    return false;
+  };
+  const visible = [];
+  const blind = [];
+  for (const t of teammates ?? []) {
+    if (t === player) continue;
+    // Only nearby teammates belong in the vision picture; a 40 m teammate
+    // behind play is noise, not a passing option.
+    if (Math.hypot(t.x - player.x, t.y - player.y) > radius) continue;
+    (inCone(t) && !occluded(t) ? visible : blind).push(t);
+  }
+  return {
+    apex: { x: player.x, y: player.y },
+    facing,
+    halfAngle,
+    radius,
+    conePoints,
+    blindConePoints,
+    visible,
+    blind,
+    coverage: visible.length + blind.length > 0
+      ? visible.length / (visible.length + blind.length)
+      : 0,
+  };
 }
 
 /** Apply a role array to the current (transient) player snapshots. */

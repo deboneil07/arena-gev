@@ -10,6 +10,7 @@ const VARIATIONS = [
   'homeProgressive', 'awayProgressive', 'setPieces',
   'combinedHeat', 'homeDefensive', 'awayDefensive',
   'homeShotMap', 'awayShotMap',
+  'playerHeat',
 ];
 
 function miniPitch(ctx, w, h) {
@@ -49,6 +50,8 @@ export function createMinimap(canvas, titleEl) {
   const H = canvas.height;
   const data = {
     heat: { home: null, away: null },
+    playerHeat: null,
+    chosenPlayerShirt: null,
     shots: { home: [], away: [] },
     passes: { home: [], away: [] },
     attacks: { home: [], away: [] },
@@ -279,6 +282,33 @@ export function createMinimap(canvas, titleEl) {
         ctx.stroke();
       }
       titleEl.textContent = (team === 0 ? 'Home' : 'Away') + ' shot map';
+    } else if (v === 'playerHeat') {
+      const heat = data.playerHeat;
+      const shirt = data.chosenPlayerShirt;
+      const rgb = [180, 120, 255];
+      if (heat && heat.max > 0) {
+        const cols = heat.cols;
+        const rows = heat.rows;
+        const cw = (W - 4) / cols;
+        const ch = (H - 4) / rows;
+        const invMax = 1 / heat.max;
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            const val = heat.grid[r * cols + c] * invMax;
+            if (val < 0.04) continue;
+            const a = Math.pow(val, 0.6) * 0.5;
+            const cx = 2 + (c + 0.5) * cw;
+            const cy = 2 + (r + 0.5) * ch;
+            const rad = Math.max(cw, ch) * 1.6;
+            const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
+            g.addColorStop(0, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${a})`);
+            g.addColorStop(1, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+            ctx.fillStyle = g;
+            ctx.fillRect(cx - rad, cy - rad, rad * 2, rad * 2);
+          }
+        }
+      }
+      titleEl.textContent = shirt != null ? `#${shirt} heat` : 'player heat';
     }
 
     ctx.restore();

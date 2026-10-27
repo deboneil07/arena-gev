@@ -30,7 +30,7 @@ use crate::event_graph::{resolve_pass, PassResolution};
 use crate::formation::Vector2;
 use crate::parser::{
     is_ball_event, BodyPart, CardKind, KeeperAction, NormalizedEvent, OutcomeReason, PassKind,
-    SetPieceTag, EVENT_TYPE_PLAYER_OFF, EVENT_TYPE_PLAYER_ON,
+    SetPieceTag, EVENT_TYPE_PLAYER_OFF, EVENT_TYPE_PLAYER_ON, PITCH_HALF_LENGTH,
 };
 use crate::tactics::{EventCue, LookaheadBlock};
 use std::collections::HashMap;
@@ -182,6 +182,8 @@ pub fn action_duration(type_id: u16) -> f32 {
 pub struct LookaheadDispatcher {
     events: Vec<NormalizedEvent>,
     cursor: usize,
+    /// Home team id, used to identify which goal a goalkeeper defends.
+    home_team_id: String,
     pub sim_time: f32,
     /// How far ahead (seconds) events are inspected.
     pub lookahead_window: f32,
@@ -209,6 +211,7 @@ impl LookaheadDispatcher {
         Self {
             events,
             cursor: 0,
+            home_team_id: String::new(),
             sim_time: 0.0,
             lookahead_window: if lookahead_window > 0.0 {
                 lookahead_window
@@ -220,6 +223,12 @@ impl LookaheadDispatcher {
             receiver_of: HashMap::new(),
             last_pass_receiver: None,
         }
+    }
+
+    /// Set the home team id (used for goalkeeper goal-side checks).
+    #[inline]
+    pub fn set_home_team(&mut self, id: impl Into<String>) {
+        self.home_team_id = id.into();
     }
 
     /// All events (chronological).
@@ -734,11 +743,23 @@ impl LookaheadDispatcher {
             } else {
                 DOER_READY_TOL
             };
-            let at_origin = agents
-                .iter()
-                .find(|a| a.id == ev.player_id)
-                .is_some_and(|a| a.position.distance(origin) <= tol);
-            if !at_origin {
+            let doer = agents.iter().find(|a| a.id == ev.player_id);
+            // A goalkeeper named on an outfield event is a feed artefact. He
+            // stays at his line and the action is staged at its logged origin,
+            // so his position must not gate the timeline.
+            let keeper_outfield = doer.is_some_and(|a| {
+                if !a.is_goalkeeper || self.home_team_id.is_empty() {
+                    return false;
+                }
+                let own_goal_x = if a.team_id == self.home_team_id {
+                    -PITCH_HALF_LENGTH
+                } else {
+                    PITCH_HALF_LENGTH
+                };
+                (origin.x - own_goal_x).abs() > 22.0
+            });
+            let at_origin = doer.is_some_and(|a| a.position.distance(origin) <= tol);
+            if !at_origin && !keeper_outfield {
                 return false;
             }
         }
