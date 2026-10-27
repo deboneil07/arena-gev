@@ -225,3 +225,93 @@ test('a malformed log is rejected instead of half-parsed', () => {
   assert.throws(() => createDribbleIndex({ v: 2, events: [] }), /schema v1/);
   assert.throws(() => createDribbleIndex(null), /schema v1/);
 });
+
+test('anonymous roster players are labelled by shirt, never by feed id', () => {
+  const roster = [
+    [['h10', 'J. Smith', 10, 4], ['h49', '', 49, 5]],
+    [['a9', 'Away Nine', 9, 4], ['a0', '', 0, 5]],
+  ];
+  const index = createDribbleIndex({
+    v: 1,
+    events: [row(3, 300, 0, 'h49', '', 40, 30)],
+    roster,
+  });
+  assert.equal(index.rosterByPid.get('h49').name, '', 'the raw feed stays empty');
+  assert.equal(index.rosterByPid.get('h49').label, 'Player 49');
+  assert.equal(index.playerByKey(0, 49).label, 'Player 49');
+  assert.equal(index.playerByKey(1, 0).label, 'Unnamed player', 'no shirt, no hash');
+  // Events without a name inherit the roster label rather than an id.
+  assert.equal(index.dribbles[0].name, 'Player 49');
+});
+
+test('a feed without take-on or carry events is flagged honestly', () => {
+  const index = fixture();
+  assert.equal(index.hasDribbleData, true);
+  const passes = createDribbleIndex({
+    v: 1,
+    events: [row(1, 100, 0, 'h10', 'J. Smith', 0, 0, { ex: 10, ey: 0 })],
+    roster: [HOME_ROSTER, []],
+  });
+  assert.equal(passes.hasDribbleData, false);
+  assert.equal(passes.dribbles.length, 0);
+});
+
+test('the horizon snaps to the stat boundaries a dribble creates', () => {
+  const index = fixture();
+  assert.equal(index.horizonAt(null), null, 'no horizon = whole match');
+  assert.equal(index.horizonAt(Infinity), null);
+  assert.equal(index.horizonAt(0), -1, 'before the first dribble nothing counts');
+  assert.equal(index.horizonAt(299.9), -1);
+  assert.equal(index.horizonAt(300), 300);
+  assert.equal(index.horizonAt(305), 300, 'inside an outcome window, nothing changed');
+  assert.equal(index.horizonAt(308), 308, 'the window closed');
+  assert.equal(index.horizonAt(99_999), 5008, 'far ahead = last outcome boundary');
+});
+
+test('the live horizon filters stats and never leaks future outcomes', () => {
+  const index = fixture();
+  assert.equal(index.playerStats('h10', { until: 350 }).attempts, 3);
+  assert.equal(index.playerStats('h10', { until: 339 }).attempts, 2);
+  // At 303 s the first take-on exists, but its shot (305 s) is still future.
+  const early = index.playerStats('h10', { until: 303 });
+  assert.equal(early.attempts, 1);
+  assert.equal(early.shotAfter, 0, 'the +5 s shot is not visible yet');
+  assert.equal(early.dribbles[0].shotAfter, null, 'the flag is suppressed, not faked');
+  const settled = index.playerStats('h10', { until: 308 });
+  assert.equal(settled.shotAfter, 1, 'the shot is counted once its window closes');
+  assert.equal(index.teamStats(0, { until: 400 }).attempts, 6);
+  assert.equal(index.teamStats(1, { until: 400 }).attempts, 0);
+});
+
+test('horizon snapping keeps the stat cache bounded and consistent', () => {
+  const index = fixture();
+  const a = index.playerStats('h10', { until: 303 });
+  const b = index.playerStats('h10', { until: 305 });
+  assert.equal(a, b, 'equal snapped horizons share one cached object');
+  assert.notEqual(a, index.playerStats('h10', { until: 308 }));
+  assert.notEqual(
+    index.playerStats('h10', { until: 308 }),
+    index.playerStats('h10'),
+    'a finite horizon never collides with whole-match stats',
+  );
+});
+
+test('game state is judged at the dribble clock, not the horizon', () => {
+  const index = fixture(); // goals at 500 (away), 505 and 510 (home)
+  assert.equal(index.gameState(400, 0), 'level');
+  // A horizon before the goals still sees only level dribbles, even though
+  // the match later ends with the home side ahead.
+  assert.equal(index.teamStats(0, { state: 'level', until: 504 }).attempts, 6);
+  assert.equal(index.teamStats(0, { state: 'ahead', until: 504 }).attempts, 0);
+  assert.equal(index.teamStats(0, { state: 'ahead', until: 600 }).attempts, 1);
+});
+
+test('percentile benchmarks use the same live window as the player', () => {
+  const index = fixture();
+  const early = index.playerPercentiles('h10', { until: 340 });
+  assert.equal(early.mateCount, 1, 'only h10 has 2+ dribbles at 05:40');
+  assert.equal(early.attempts, null, 'no benchmark, no percentile — not a fake 0');
+  const full = index.playerPercentiles('h10');
+  assert.ok(full.mateCount >= 3);
+  assert.notEqual(full.attempts, null);
+});

@@ -17,7 +17,7 @@ web/
 ├── graphs.test.mjs
 ├── effects.js         # analytical layer toggles + shuffle state
 ├── effects.test.mjs
-├── dribbles.js        # pure whole-match dribble analysis (zones, stats, insights)
+├── dribbles.js        # pure dribble analysis (zones, stats, live window, insights)
 ├── dribbles.test.mjs
 ├── dribbleOverlay.js  # Canvas drawing for the 12-zone dribble heat layer
 ├── dribbleOverlay.test.mjs
@@ -193,11 +193,35 @@ node --test web/*.test.mjs
 
 ## Dribble analysis
 
-The **Dribbles** effect draws a whole-match take-on/carry layer over the pitch,
-and clicking into it opens a slide-in analysis panel. Everything is derived
-once per match from `engine.get_analysis_json()` (a static schema-v1 log of
-every event plus both rosters), so results never depend on playback position —
-seeking, pausing and switching matches all stay consistent.
+The **Dribbles** effect draws a take-on/carry layer over the pitch, and clicking
+into it opens a slide-in analysis panel. Everything is derived once per match
+from `engine.get_analysis_json()` (a schema-v1 log of every event plus both
+rosters). The index itself is static and seek-safe; what it *shows* is
+time-aware, so the analysis grows live as the match plays.
+
+Any match file dropped into `match_engine/data/` is picked up by
+`examples/gen_manifest.rs` and works with the same pipeline — there are no
+match-specific constants. Feeds that contain no take-on/carry events (the
+synthetic Arsenal and Man City fixtures are examples) get an honest empty
+state instead of invented numbers.
+
+### Live window
+
+- **So far** is the default: zones, markers and every panel stat count only
+  what has happened up to the sim clock. Kick-off starts blank and the view
+  fills in as the match plays; seeking moves the window with the clock.
+- **Whole match** flips the same views to the finished match. The toggle sits
+  at the top of the panel (above its filters) and under the pitch beside the
+  zone opacity — one state, two places to reach it. The pitch-side twin hides
+  while the panel is open, since the panel carries its own copy.
+- The model snaps a horizon to the moments stats can change (a dribble starts,
+  or its 8 s post-dribble outcome window closes), so live rendering is cheap
+  and never leaks the future: a shot that happens after the current clock is
+  not counted yet, and only goals up to a dribble's own clock decide the
+  game-state filter.
+- Names come from the event rows; roster players the feed never names (bench
+  players in Opta F24 often arrive anonymous) are labelled by shirt — `#49`
+  in the squad, `Player 49` in headers and exports — never by the raw feed id.
 
 ### Pitch layer
 
@@ -227,10 +251,11 @@ lens follows the pitch's followed side (and flips with it live) unless the
 per-player lens is open.
 
 - **Filters** — half (1st/2nd/both), game state (ahead/level/behind) and a
-  player picker apply to every stat in the view.
+  player picker apply to every stat in the view, on top of the time window.
 - **Team lens** — attempt/success/shot-after totals, the busiest-zone table
   (click a row to select that zone), the ✓/✗/○ effectiveness scale, rule-based
-  insights and the squad list (click a player to switch lenses).
+  insights and the squad list (click a player to switch lenses). A feed with no
+  dribble events shows a single explanatory note instead of empty charts.
 - **Player lens** — four percentile metrics vs team-mates with ≥2 dribbles
   (attempts, success rate, gain, shot-after rate) with star ratings; a
   **per-zone circle map** where circle *size* = attempts, *fill* = success
@@ -238,7 +263,7 @@ per-player lens is open.
   and a **minute strip** of every attempt across the 90 minutes. Clicking the
   strip seeks the sim to that attempt (read-only scrubber — it jumps, it does
   not scrub). The view's **Export** button downloads the current view,
-  filters and every attempt as JSON.
+  filters, time window and every attempt as JSON.
 
 ### View controls
 
@@ -246,6 +271,11 @@ per-player lens is open.
 **Reset view**. The transform is a single canvas matrix — identity at rest,
 so hit tests and export coordinates stay honest. Plain wheel still scrolls
 the page; touch keeps vertical page scrolling (`touch-action: pan-y`).
+
+The **So far / Whole match** toggle under the pitch mirrors the panel's stats
+window; it hides while the panel is open (the panel carries the same control).
+**Zones** sets the dribble-layer opacity. Seeking while paused updates the HUD
+clock and score immediately rather than waiting for playback to resume.
 
 `window.__gev` exposes read-only handles (`engine`, `players`, `panel`,
 `index`, `view`, `toScreen`, `seekTo`) for console debugging and automated

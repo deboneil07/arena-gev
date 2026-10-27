@@ -320,17 +320,18 @@ function makeShell() {
   return { shell, tabs };
 }
 
-function makePanel() {
+function makePanel(nextIndex = fixture()) {
   const { shell, tabs } = makeShell();
-  const log = { seeks: [], selections: [], zones: [], toggles: [], statuses: [] };
+  const log = { seeks: [], selections: [], zones: [], toggles: [], statuses: [], horizons: [] };
   const panel = createPlayerPanel(shell, {
     onSeek: (secs, dribble) => log.seeks.push({ secs, dribble }),
     onSelection: (sel) => log.selections.push(sel),
     onZoneSelection: (z) => log.zones.push(z),
     onToggleZones: () => log.toggles.push(true),
+    onHorizonChange: (mode) => log.horizons.push(mode),
     status: (msg) => log.statuses.push(msg),
   });
-  panel.setIndex(fixture(), 0);
+  panel.setIndex(nextIndex, 0);
   return { panel, shell, tabs, log };
 }
 
@@ -343,9 +344,15 @@ test('the team view renders filters, zone table, scale, insights and squad', () 
   assert.equal(panel.isOpen(), true);
   assert.equal(doc.activeElement.dataset.tab, 'team', 'open() focuses the active tab');
 
-  assert.match(shell.querySelector('.pp-context').textContent, /^Home · full match$/);
+  assert.match(shell.querySelector('.pp-context').textContent, /^Home · both halves$/);
 
   const body = shell.querySelector('.pp-body');
+  // The stats window defaults to the live clock and is switchable.
+  const segButtons = body.querySelectorAll('.seg-btn');
+  assert.equal(segButtons.length, 2, 'so far / whole match');
+  assert.equal(segButtons[0].getAttribute('aria-pressed'), 'true', 'live by default');
+  assert.match(body.querySelector('.pp-scope-clock').textContent, /^up to /);
+
   assert.equal(body.querySelectorAll('select').length, 3, 'half, game state and player filters');
   assert.equal(body.querySelectorAll('.pp-scale-row').length, 7, 'seven effectiveness bands');
   assert.equal(body.querySelectorAll('.pp-player-btn').length, HOME_ROSTER.length);
@@ -517,6 +524,8 @@ test('export serialises the current view, filters and every attempt', async () =
   assert.equal(payload.dribbles[0].minute, '05:00');
   assert.equal(payload.dribbles[0].zone, 3);
   assert.equal(payload.filters.period, 'all');
+  assert.equal(payload.horizon.mode, 'sofar', 'the export states its stats window');
+  assert.equal(payload.horizon.untilSeconds, null, 'no clock reported yet → whole match');
 });
 
 test('the panel is inert before an index arrives', () => {
@@ -530,4 +539,108 @@ test('the panel is inert before an index arrives', () => {
   panel.setIndex(fixture(), 0);
   assert.equal(panel.layerStats().attempts, 16, 'stats arrive with the index');
   assert.equal(panel.selectedZone, null, 'a fresh index resets stale selections');
+});
+
+test('the panel grows live with the sim clock and can show the whole match', () => {
+  const { panel, shell, log } = makePanel();
+  panel.open('team');
+  const attempts = () => shell.querySelector('.pp-summary').querySelectorAll('strong')[0].textContent;
+
+  panel.setNow(0);
+  assert.equal(attempts(), '0', 'kick-off shows nothing yet');
+  assert.match(shell.querySelector('.pp-empty').textContent, /No dribbles yet/);
+  panel.setNow(330);
+  assert.equal(attempts(), '2', 'two take-ons by 05:30');
+  panel.setNow(400);
+  assert.equal(attempts(), '6');
+  assert.match(shell.querySelector('.pp-scope-clock').textContent, /up to 06:40/);
+
+  // The whole-match view is one click away, and back to the live clock.
+  panel.setHorizonMode('whole');
+  assert.equal(attempts(), '16');
+  assert.equal(panel.horizonMode, 'whole');
+  assert.deepEqual(log.horizons, ['whole']);
+  const buttons = shell.querySelector('.pp-body').querySelectorAll('.seg-btn');
+  assert.equal(buttons[1].getAttribute('aria-pressed'), 'true');
+  panel.setHorizonMode('sofar');
+  assert.equal(attempts(), '6');
+  assert.deepEqual(log.horizons, ['whole', 'sofar']);
+
+  // The sim clock keeps advancing underneath; stats only move when it must.
+  panel.setNow(401);
+  assert.equal(attempts(), '6', 'no dribble boundary crossed, same numbers');
+  panel.setNow(600);
+  assert.equal(attempts(), '7', 'the carry at 10:00 joins the live window');
+});
+
+test('a feed without dribble events explains itself instead of pretending', () => {
+  const index = createDribbleIndex({
+    v: 1,
+    events: [row(1, 100, 0, 'h10', 'J. Smith', 0, 0, { ex: 10, ey: 0 })],
+    roster: [HOME_ROSTER, [['a9', 'Away Nine', 9, 4]]],
+  });
+  const { panel, shell } = makePanel(index);
+  panel.open('team');
+  assert.equal(shell.querySelector('.pp-feed-title').textContent, 'No dribble events in this feed');
+  assert.equal(shell.querySelectorAll('.pp-strip').length, 0, 'no dead scrubber');
+  assert.equal(shell.querySelectorAll('.pp-scale-row').length, 0, 'no rating scale to misread');
+  assert.equal(shell.querySelectorAll('.pp-player-btn').length, HOME_ROSTER.length, 'squad stays browseable');
+
+  panel.selectPlayer('h10');
+  assert.equal(panel.view, 'player');
+  assert.equal(shell.querySelector('.pp-feed-title').textContent, 'No dribble events in this feed');
+  assert.equal(shell.querySelectorAll('.pp-metric').length, 0, 'no fake zero metrics');
+});
+
+test('anonymous players are labelled by shirt in the squad and the header', () => {
+  const index = createDribbleIndex({
+    v: 1,
+    events: [row(3, 300, 0, 'h49', '', 40, 30)],
+    roster: [[['h49', '', 49, 5]], []],
+  });
+  const { panel, shell } = makePanel(index);
+  panel.open('team');
+
+  const squadRow = shell.querySelector('.pp-player-btn');
+  assert.match(squadRow.textContent, /#49/);
+  assert.match(squadRow.textContent, /Substitute/, 'role stands in for a missing name');
+  assert.match(squadRow.getAttribute('title'), /Player 49/);
+  const option = shell.querySelector('.pp-select[aria-label="Player"]').querySelectorAll('option')[1];
+  assert.equal(option.textContent, '#49', 'the dropdown does not repeat the shirt');
+
+  panel.selectPlayer('h49');
+  assert.equal(shell.querySelector('.pp-context').textContent, 'Player 49 · Home');
+  assert.match(shell.querySelector('.pp-identity').textContent, /Player 49/);
+});
+
+test('live updates wait for an open control instead of rebuilding under it', () => {
+  const { panel, shell } = makePanel();
+  panel.open('team');
+  panel.setNow(0);
+  const attempts = () => shell.querySelector('.pp-summary strong').textContent;
+  assert.equal(attempts(), '0');
+
+  // Focus a filter (as if its popup were open) — the clock moves on, but the
+  // panel must not yank the control away mid-interaction.
+  const select = shell.querySelector('.pp-select');
+  select.focus();
+  panel.setNow(400);
+  assert.equal(attempts(), '0', 'the de-rendered view is held');
+  assert.equal(panel.layerStats().attempts, 6, 'the model already knows the truth');
+
+  // Leaving the body catches up; tabbing inside it would not.
+  const body = shell.querySelector('.pp-body');
+  const other = shell.querySelector('.pp-player-btn');
+  body.fire('focusout', { relatedTarget: other });
+  assert.equal(attempts(), '0', 'moving focus inside the body does not rebuild');
+  body.fire('focusout', { relatedTarget: null });
+  assert.equal(attempts(), '6');
+
+  // The footer is rebuilt too: hold it the same way.
+  const action = shell.querySelector('.pp-actions button');
+  action.focus();
+  panel.setNow(700);
+  assert.equal(attempts(), '6', 'footer focus also holds the rebuild');
+  shell.querySelector('.pp-actions').fire('focusout', { relatedTarget: null });
+  assert.equal(attempts(), '10', 'catch-up after leaving the footer');
 });

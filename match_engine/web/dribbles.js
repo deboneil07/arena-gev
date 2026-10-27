@@ -1,8 +1,12 @@
-// Whole-match dribble analysis: zone geometry, per-player stats, filters,
-// percentiles and rule-based insights.
+// Dribble analysis: zone geometry, per-player stats, filters, percentiles
+// and rule-based insights.
 //
 // DOM-free and Canvas-free so the model can be unit-tested from Node. The
 // renderer owns the drawing; the panel owns the markup.
+//
+// Every stat accessor takes an optional `until` match-second horizon, so the
+// same model serves the live "so far" view and the whole-match view. The
+// index itself is still built once per match and never mutates.
 //
 // Input rows come from `analysis_log.rs` (field order fixed):
 //   event: [type, display_secs, match_secs, period, team, player_id,
@@ -144,14 +148,31 @@ export function createDribbleIndex(raw) {
     ok: row[EV.OUT] === 1,
   }));
 
+  // Feed rows: [pid, name, shirt, position_category]. The feed only names a
+  // player once he appears in a named event, so bench players can arrive
+  // anonymous. Label them by shirt — never leak the raw feed id (a 25-char
+  // hash) into the UI.
   const roster = [0, 1].map((team) =>
-    (raw.roster?.[team] ?? []).map((r) => ({
-      pid: r[0], name: r[1] || r[0], shirt: r[2], pos: r[3], team,
-    })),
+    (raw.roster?.[team] ?? []).map((r) => {
+      const name = String(r[1] ?? '').trim();
+      const shirt = Number(r[2]) || 0;
+      return {
+        pid: r[0],
+        name,
+        shirt,
+        pos: Number(r[3]) || 0,
+        team,
+        label: name || (shirt ? `Player ${shirt}` : 'Unnamed player'),
+      };
+    }),
   );
 
   const rosterByPid = new Map();
   for (const side of roster) for (const p of side) rosterByPid.set(p.pid, p);
+
+  // Does the feed itself carry dribble events? Heartbeat for the honest
+  // empty state: a match without them is not the same as a filtered-out view.
+  const hasDribbleData = events.some((e) => e.ty === TAKE_ON || e.ty === CARRY);
 
   // Goal log drives the game-state filter.
   const goals = events
@@ -190,7 +211,7 @@ export function createDribbleIndex(raw) {
       period: e.period,
       team: e.team,
       pid: e.pid,
-      name: e.name,
+      name: e.name || rosterByPid.get(e.pid)?.label || 'Unnamed player',
       x: e.x,
       y: e.y,
       ex: e.ex,
@@ -242,18 +263,64 @@ export function createDribbleIndex(raw) {
     }
   }
 
+  // ── Time horizon ──────────────────────────────────────────────
+  // The live view shows only what has happened so far. Stats change at
+  // exactly two moments per dribble: when it happens, and when its
+  // post-dribble outcome window closes. A horizon is therefore snapped down
+  // to the last such boundary — equal horizons share one cached stat object,
+  // and the panel only has to re-render when a boundary is crossed.
+  const horizonMarks = [];
+  for (const d of dribbles) {
+    horizonMarks.push(d.mt);
+    horizonMarks.push(d.mt + POST_SHOT_WINDOW);
+  }
+  horizonMarks.sort((a, b) => a - b);
+
+  /**
+   * Match-second horizon → last stat boundary at or before it.
+   * `null`/non-finite means "whole match"; `-1` means "before the first
+   * dribble", i.e. nothing has happened yet.
+   */
+  function horizonAt(until) {
+    if (until == null || !Number.isFinite(until)) return null;
+    let lo = 0;
+    let hi = horizonMarks.length - 1;
+    let best = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (horizonMarks[mid] <= until) { best = horizonMarks[mid]; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    return best;
+  }
+
   // ── Filters ───────────────────────────────────────────────────
   /**
-   * Apply `{ period: 'all'|1|2, player: pid|'', state: 'all'|'ahead'… }`.
-   * `state` is resolved per dribble against that player's team.
+   * Apply `{ period: 'all'|1|2, player: pid|'', state: 'all'|'ahead'…,
+   * until: matchSecs|null }`. `state` is resolved per dribble against that
+   * player's team (so a goal after the horizon can never colour a dribble:
+   * only goals up to the dribble's own clock are counted). `until` caps the
+   * window to the live clock.
    */
   function applyFilters(list, filters = {}) {
     const period = filters.period ?? 'all';
     const state = filters.state ?? 'all';
+    const until = horizonAt(filters.until);
     let out = list;
     if (period !== 'all') out = out.filter((d) => d.period === Number(period));
-    if (filters.player) out = out.filter((d) => d.pid === filters.player);
+    if (filters.player && filters.player !== 'all') out = out.filter((d) => d.pid === filters.player);
     if (state !== 'all') out = out.filter((d) => gameState(d.mt, d.team) === state);
+    if (until != null) {
+      out = out.filter((d) => d.mt <= until);
+      // A post-dribble outcome that lands after the horizon is not known
+      // yet; suppress it rather than leak the future into "so far" stats.
+      // Unaffected dribbles keep their identity (strip and hover reuse it).
+      out = out.map((d) => (
+        d.mt + POST_SHOT_WINDOW <= until || (d.shotAfter == null && d.keepAfter == null)
+          ? d
+          : { ...d, shotAfter: null, keepAfter: null }
+      ));
+    }
     return out;
   }
 
@@ -330,16 +397,20 @@ export function createDribbleIndex(raw) {
     return statCache.get(key);
   }
 
+  /** Cache key for a scope; the horizon is pre-snapped, so keys stay bounded. */
+  function statKey(scope, filters) {
+    const until = horizonAt(filters.until);
+    return `${scope}:${filters.period ?? 'all'}:${filters.state ?? 'all'}:${until ?? 'all'}`;
+  }
+
   function playerStats(pid, filters = {}) {
-    const key = `p:${pid}:${filters.period ?? 'all'}:${filters.state ?? 'all'}`;
     const base = byPid.get(pid) ?? [];
-    return cachedStats(applyFilters(base, filters), key);
+    return cachedStats(applyFilters(base, filters), statKey(`p:${pid}`, filters));
   }
 
   function teamStats(team, filters = {}) {
-    const key = `t:${team}:${filters.period ?? 'all'}:${filters.state ?? 'all'}:${filters.player ?? ''}`;
     const base = dribbles.filter((d) => d.team === team);
-    return cachedStats(applyFilters(base, filters), key);
+    return cachedStats(applyFilters(base, filters), statKey(`t:${team}:${filters.player ?? ''}`, filters));
   }
 
   // ── Percentiles vs team-mates (same match, ≥2 dribbles) ───────
@@ -482,28 +553,15 @@ export function createDribbleIndex(raw) {
     return roster[team] ?? [];
   }
 
-  /** Resolve a clicked pitch position to a dribble of the selection, if any. */
-  function dribbleNear(x, y, team, radius = 4) {
-    let best = null;
-    let bestD = radius * radius;
-    for (const d of dribbles) {
-      if (team != null && d.team !== team) continue;
-      const dx = d.x - x;
-      const dy = d.y - y;
-      const dist = dx * dx + dy * dy;
-      if (dist <= bestD) { bestD = dist; best = d; }
-    }
-    return best;
-  }
-
   return {
     events,
     dribbles,
     roster,
     rosterByPid,
     goals,
+    hasDribbleData,
     gameState,
-    scoreAt,
+    horizonAt,
     applyFilters,
     statsFor,
     playerStats,
@@ -512,7 +570,6 @@ export function createDribbleIndex(raw) {
     stars,
     insights,
     rosterFor,
-    dribbleNear,
     /** Player entry for a (team, shirt) render-buffer pair. */
     playerByKey(team, shirt) {
       return roster[team]?.find((p) => p.shirt === shirt) ?? null;
@@ -523,7 +580,7 @@ export function createDribbleIndex(raw) {
     dribblesOf(pid) {
       return byPid.get(pid) ?? [];
     },
-    /** Whole-match dribbles of one team, optionally filtered. */
+    /** Dribbles of one team, optionally filtered (filters may include `until`). */
     teamDribbles(team, filters) {
       return applyFilters(dribbles.filter((d) => d.team === team), filters);
     },

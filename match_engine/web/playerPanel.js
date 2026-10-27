@@ -13,7 +13,6 @@ import {
   zoneOf,
   zoneWorldRect,
 } from './dribbles.js';
-import { drawDribbleLayer } from './dribbleOverlay.js';
 
 const POSITIONS = {
   1: 'Goalkeeper', 2: 'Defender', 3: 'Midfielder', 4: 'Forward', 5: 'Substitute',
@@ -53,7 +52,8 @@ function starsText(n) {
 
 /**
  * @param shell the `#player-panel` element from index.html
- * @param callbacks `{ onSeek(secs), onSelection(selection), onToggleZones(), status(msg) }`
+ * @param callbacks `{ onSeek(secs), onSelection(selection), onZoneSelection(zone),
+ *   onToggleZones(), onHorizonChange(mode), status(msg) }`
  */
 export function createPlayerPanel(shell, callbacks = {}) {
   if (!shell) return null;
@@ -72,7 +72,13 @@ export function createPlayerPanel(shell, callbacks = {}) {
   let view = 'team';
   let compare = false;
   let selectedZone = null;
-  let filters = { period: 'all', state: 'all', player: 'all' };
+  let filters = { period: 'all', state: 'all' };
+  let horizonMode = 'sofar'; // stats window: live clock, or the full match
+  let nowSecs = Infinity;    // sim clock while live (∞ until the app reports one)
+  let lastHorizon;           // snapped stat boundary of the last render
+  let clockEl = null;        // live "up to mm:ss" caption
+  let clockText = '';
+  let pendingLive = false;   // a stat boundary was crossed while focus was inside the body
   let tooltipTimer = 0;
 
   /** The panel is open when it carries `is-open` (CSS drives the slide). */
@@ -98,6 +104,91 @@ export function createPlayerPanel(shell, callbacks = {}) {
     const th = Number.isFinite(tooltip.offsetHeight) ? tooltip.offsetHeight : 0;
     tooltip.style.left = `${Math.max(2, Math.min(x, hw - tw - 4))}px`;
     tooltip.style.top = `${Math.max(2, Math.min(y, hh - th - 4))}px`;
+  }
+
+  // ── Scope: filters + live time window ─────────────────────────
+  /** Stat filters for the current view, including the live time horizon. */
+  function scopeFilters() {
+    return {
+      period: filters.period,
+      state: filters.state,
+      until: horizonMode === 'sofar' ? nowSecs : null,
+    };
+  }
+
+  /** `mm:ss` of the live horizon, or null while no clock is known yet. */
+  function horizonClock() {
+    return Number.isFinite(nowSecs) ? formatClock(nowSecs) : null;
+  }
+
+  function clockCaption() {
+    const clock = horizonClock();
+    return clock ? `up to ${clock}` : 'up to now';
+  }
+
+  /**
+   * The app reports the sim clock every frame. Re-render only when the stat
+   * boundary moves — the model snaps horizons, so most frames are a no-op.
+   */
+  function setNow(matchSecs) {
+    if (!Number.isFinite(matchSecs)) return;
+    nowSecs = matchSecs;
+    if (horizonMode !== 'sofar') return;
+    const caption = clockCaption();
+    if (clockEl && caption !== clockText) {
+      clockText = caption;
+      clockEl.textContent = caption;
+    }
+    if (!index || !isOpen()) return;
+    const horizon = index.horizonAt(nowSecs);
+    if (horizon === lastHorizon) return;
+    // Never rebuild the panel under a keyboard user mid-interaction — an open
+    // <select> would snap shut, and a focused button would vanish. Catch up
+    // when focus leaves the rebuilt sections.
+    if (ui.body.contains(document.activeElement) || ui.actions.contains(document.activeElement)) {
+      pendingLive = true;
+      return;
+    }
+    lastHorizon = horizon;
+    render();
+  }
+
+  function setHorizonMode(mode) {
+    if (mode !== 'sofar' && mode !== 'whole') return;
+    if (horizonMode === mode) return;
+    horizonMode = mode;
+    if (isOpen()) render();
+    callbacks.onHorizonChange?.(mode);
+  }
+
+  function scopeRow() {
+    const option = (mode, text) => el('button', {
+      type: 'button',
+      class: 'seg-btn',
+      'aria-pressed': String(horizonMode === mode),
+      text,
+      onclick: () => setHorizonMode(mode),
+    });
+    clockText = clockCaption();
+    clockEl = horizonMode === 'sofar'
+      ? el('span', { class: 'pp-scope-clock', text: clockText })
+      : null;
+    return el('div', { class: 'pp-scope' },
+      el('div', { class: 'seg', role: 'group', 'aria-label': 'Stats time window' },
+        option('sofar', 'So far'), option('whole', 'Whole match')),
+      clockEl,
+    );
+  }
+
+  /** Honest empty state for a feed that carries no take-on/carry events. */
+  function feedNote() {
+    return el('div', { class: 'pp-block pp-feed-empty' },
+      el('div', { class: 'pp-feed-title', text: 'No dribble events in this feed' }),
+      el('div', {
+        class: 'pp-feed-body',
+        text: 'This match file records no take-ons or carries, so there are no zones or dribble stats to show. The pitch, events and other overlays still work.',
+      }),
+    );
   }
 
   // ── Shared blocks ─────────────────────────────────────────────
@@ -130,7 +221,7 @@ export function createPlayerPanel(shell, callbacks = {}) {
       'aria-label': 'Time period',
       onchange: (ev) => { filters.period = ev.target.value; render(); },
     },
-      el('option', { value: 'all', selected: filters.period === 'all', text: 'Full match' }),
+      el('option', { value: 'all', selected: filters.period === 'all', text: 'Both halves' }),
       el('option', { value: '1', selected: filters.period === '1', text: 'First half' }),
       el('option', { value: '2', selected: filters.period === '2', text: 'Second half' }),
     );
@@ -165,7 +256,9 @@ export function createPlayerPanel(shell, callbacks = {}) {
       index.rosterFor(team).map((p) => el('option', {
         value: p.pid,
         selected: Boolean(inPlayerView && pid === p.pid),
-        text: `#${p.shirt} ${p.name}`,
+        // The shirt is already the prefix; an unnamed player needs no
+        // "Player 12" echo next to it.
+        text: `#${p.shirt}${p.name ? ` ${p.name}` : ''}`,
       })),
     );
     return el('div', { class: 'pp-filters' }, half, state, player);
@@ -395,14 +488,27 @@ export function createPlayerPanel(shell, callbacks = {}) {
 
   // ── Team view ─────────────────────────────────────────────────
   function teamView() {
-    const stats = index.teamStats(team, { period: filters.period, state: filters.state });
+    const scope = scopeFilters();
+    const stats = index.teamStats(team, scope);
     const dribbles = stats.dribbles;
-    const notes = index.insights(stats, 'this team');
+    // Panel-owned empty copy: "no data in the feed" and "filtered to zero"
+    // are different stories, and the model's generic note can't tell them.
+    const notes = index.insights(stats, 'this team').filter((n) => n.kind !== 'empty');
 
     const zonesUsed = stats.zones
       .map((z, i) => ({ ...z, id: i + 1 }))
       .filter((z) => z.attempts > 0)
       .sort((a, b) => b.attempts - a.attempts);
+
+    const noDribbleFeed = !index.hasDribbleData;
+    const teamHasNone = !noDribbleFeed && index.teamStats(team).attempts === 0;
+    const clock = horizonClock();
+    const filtered = filters.period !== 'all' || filters.state !== 'all';
+    const emptyText = teamHasNone
+      ? 'No dribbles recorded for this team in this match.'
+      : horizonMode === 'sofar' && !filtered && clock
+        ? `No dribbles yet up to ${clock}. Play on or switch to Whole match.`
+        : 'No dribbles match these filters. Try Whole match, another half or game state.';
 
     const zoneTable = zonesUsed.length
       ? el('table', { class: 'pp-table' },
@@ -424,7 +530,7 @@ export function createPlayerPanel(shell, callbacks = {}) {
           el('td', { text: effectivenessLabel(Math.round((z.success ?? 0) * 100)) }),
         ))),
       )
-      : el('div', { class: 'pp-empty', text: 'No dribbles match these filters. Try the full match or another game state.' });
+      : el('div', { class: 'pp-empty', text: emptyText });
 
     const scale = el('div', { class: 'pp-scale' },
       [['90–100', 'Elite'], ['75–89', 'Very good'], ['60–74', 'Good'], ['45–59', 'Average'],
@@ -438,15 +544,15 @@ export function createPlayerPanel(shell, callbacks = {}) {
 
     const roster = el('div', { class: 'pp-roster' },
       index.rosterFor(team).map((p) => {
-        const s = index.playerStats(p.pid, { period: filters.period, state: filters.state });
+        const s = index.playerStats(p.pid, scope);
         return el('button', {
           type: 'button',
           class: 'pp-player-btn',
-          title: `${p.name} · ${s.attempts} dribbles`,
+          title: `${p.label} · ${s.attempts} dribbles`,
           onclick: () => selectPlayer(p.pid),
         },
           el('span', { class: 'pp-shirt', text: `#${p.shirt}` }),
-          el('span', { class: 'pp-player-name', text: p.name }),
+          el('span', { class: 'pp-player-name', text: p.name || POSITIONS[p.pos] || 'Player' }),
           el('span', { class: 'pp-player-att', text: s.attempts ? `${s.attempts} att` : '—' }),
         );
       }),
@@ -457,6 +563,14 @@ export function createPlayerPanel(shell, callbacks = {}) {
       el('span', {}, el('strong', { text: pctText(stats.success) }), ' success'),
       el('span', {}, el('strong', { text: String(stats.shotAfter) }), ` shots within ${POST_SHOT_WINDOW}s`),
     );
+
+    const squad = el('div', { class: 'pp-block' },
+      el('div', { class: 'pp-block-title', text: 'Squad' }),
+      roster,
+    );
+
+    // No dribble events anywhere in this feed: explain, don't pretend.
+    if (noDribbleFeed) return [filterRow(), feedNote(), summary, squad];
 
     return [
       filterRow(),
@@ -469,10 +583,7 @@ export function createPlayerPanel(shell, callbacks = {}) {
       ),
       insightList(notes),
       stripBlock(dribbles, 'Match timeline'),
-      el('div', { class: 'pp-block' },
-        el('div', { class: 'pp-block-title', text: 'Squad' }),
-        roster,
-      ),
+      squad,
     ];
   }
 
@@ -480,27 +591,38 @@ export function createPlayerPanel(shell, callbacks = {}) {
   function playerView() {
     const entry = index.playerById(pid);
     if (!entry) return [el('div', { class: 'pp-empty', text: 'Pick a player from the squad list.' })];
-    const pf = { period: filters.period, state: filters.state };
-    const stats = index.playerStats(pid, pf);
-    const pct = index.playerPercentiles(pid, pf);
+    const scope = scopeFilters();
+    const stats = index.playerStats(pid, scope);
+    const pct = index.playerPercentiles(pid, scope);
     const dribbles = stats.dribbles;
-    const notes = index.insights(stats, entry.name);
+    const notes = index.insights(stats, entry.label).filter((n) => n.kind !== 'empty');
 
     const identity = el('div', { class: 'pp-identity' },
       el('div', { class: 'pp-name' },
-        el('strong', { text: entry.name }),
-        el('span', { class: 'pp-shirt-big', text: `#${entry.shirt}` }),
+        el('strong', { text: entry.label }),
+        // The label already carries the shirt when the feed never named him.
+        entry.name ? el('span', { class: 'pp-shirt-big', text: `#${entry.shirt}` }) : null,
       ),
       el('div', { class: 'pp-meta', text: `${POSITIONS[entry.pos] ?? 'Player'} · ${team === 0 ? 'Home' : 'Away'}` }),
     );
 
+    if (!index.hasDribbleData) return [identity, filterRow(), feedNote()];
+
     if (!stats.attempts) {
-      return [identity,
+      const whole = index.playerStats(pid).attempts;
+      const clock = horizonClock();
+      const body = !whole
+        ? 'This player did not carry the ball at any point in this match.'
+        : horizonMode === 'sofar' && clock
+          ? `Nothing yet up to ${clock} — play on or switch to Whole match.`
+          : 'Switch the half or game-state filter, or pick a player who carried the ball.';
+      return [
+        identity,
+        filterRow(),
         el('div', { class: 'pp-empty' },
-          el('div', { class: 'pp-empty-title', text: `No dribbles recorded for ${entry.name}` }),
-          el('div', { class: 'pp-empty-body', text: 'Switch the half or game-state filter, or pick a player who carried the ball.' }),
+          el('div', { class: 'pp-empty-title', text: `No dribbles recorded for ${entry.label}` }),
+          el('div', { class: 'pp-empty-body', text: body }),
         ),
-        filterRow(), zoneChip(),
       ];
     }
 
@@ -518,7 +640,7 @@ export function createPlayerPanel(shell, callbacks = {}) {
 
     const compareBlock = !compare ? null : (() => {
       const mates = index.rosterFor(team)
-        .map((p) => index.playerStats(p.pid, pf))
+        .map((p) => index.playerStats(p.pid, scope))
         .filter((s) => s.attempts >= 2);
       const avg = (get) => (mates.length ? mates.reduce((a, s) => a + get(s), 0) / mates.length : 0);
       const row = (label, mine, theirs, fmt) => el('tr', {},
@@ -530,7 +652,7 @@ export function createPlayerPanel(shell, callbacks = {}) {
         el('div', { class: 'pp-block-title', text: 'Compared with team-mates' }),
         el('table', { class: 'pp-table pp-compare' },
           el('thead', {}, el('tr', {},
-            el('th', { text: 'Metric' }), el('th', { text: entry.name }), el('th', { text: 'Team average' }))),
+            el('th', { text: 'Metric' }), el('th', { text: entry.label }), el('th', { text: 'Team average' }))),
           el('tbody', {},
             row('Attempts', stats.attempts, avg((s) => s.attempts), (v) => v.toFixed(1)),
             row('Success', stats.success ?? 0, avg((s) => s.success ?? 0), (v) => `${Math.round(v * 100)}%`),
@@ -553,7 +675,7 @@ export function createPlayerPanel(shell, callbacks = {}) {
           'Share of dribbles that beat the defender or kept the ball'),
         metricRow('Dribbles', String(stats.attempts), pct.attempts, index.stars(pct.attempts),
           'Take-ons plus progressive carries'),
-        metricRow('Progressive metres', stats.gainTotal.toFixed(0), pct.gain, index.stars(pct.gain),
+        metricRow('Progressive metres', stats.gainSamples ? stats.gainTotal.toFixed(0) : '—', pct.gain, index.stars(pct.gain),
           'Metres gained forward on dribbles with a measured end point'),
         metricRow(`Shot within ${POST_SHOT_WINDOW}s`, pctText(stats.shotRate), pct.shotRate, index.stars(pct.shotRate),
           'Dribbles after which the same player shot inside the window'),
@@ -580,18 +702,23 @@ export function createPlayerPanel(shell, callbacks = {}) {
   // ── Render ────────────────────────────────────────────────────
   function activeStats() {
     if (!index) return null;
-    const pf = { period: filters.period, state: filters.state };
-    if (view === 'player' && pid) return index.playerStats(pid, pf);
-    return index.teamStats(team, pf);
+    const scope = scopeFilters();
+    if (view === 'player' && pid) return index.playerStats(pid, scope);
+    return index.teamStats(team, scope);
   }
 
   function render() {
     if (!index) return;
+    pendingLive = false;
+    // The live view re-renders at stat boundaries only; remember which one
+    // this render shows so setNow can tell whether anything has moved.
+    lastHorizon = index.horizonAt(horizonMode === 'sofar' ? nowSecs : null);
     // The tooltip element is reused across renders: a filter change while
     // hovering the zone map must not leave it stuck open over new content.
     // Hide it immediately — the 60 ms hover-out delay would show stale text.
     if (tooltipTimer) clearTimeout(tooltipTimer);
     tooltip.hidden = true;
+    clockEl = null;
     for (const tab of ui.tabs.querySelectorAll('[role="tab"]')) {
       const active = tab.dataset.tab === view;
       tab.setAttribute('aria-selected', String(active));
@@ -601,10 +728,12 @@ export function createPlayerPanel(shell, callbacks = {}) {
 
     const entry = pid ? index.playerById(pid) : null;
     ui.context.textContent = view === 'player' && entry
-      ? `${entry.name} · #${entry.shirt} · ${team === 0 ? 'Home' : 'Away'}`
-      : `${team === 0 ? 'Home' : 'Away'} · ${filters.period === 'all' ? 'full match' : filters.period === '1' ? 'first half' : 'second half'}`;
+      ? [entry.label, entry.name ? `#${entry.shirt}` : null, team === 0 ? 'Home' : 'Away'].filter(Boolean).join(' · ')
+      : `${team === 0 ? 'Home' : 'Away'} · ${filters.period === 'all' ? 'both halves' : filters.period === '1' ? 'first half' : 'second half'}`;
 
-    const blocks = (view === 'player' ? playerView() : teamView()).filter(Boolean);
+    const blocks = [scopeRow(), ...(view === 'player' ? playerView() : teamView()).filter(Boolean)];
+    // Live updates re-render mid-read; keep the reader's scroll position.
+    const scrollTop = ui.body.scrollTop;
     ui.body.innerHTML = '';
     const redraws = [];
     for (const block of blocks) {
@@ -618,6 +747,7 @@ export function createPlayerPanel(shell, callbacks = {}) {
       ui.body.append(block);
     }
     ui.body.classList.toggle('is-player', view === 'player');
+    if (scrollTop) ui.body.scrollTop = scrollTop;
 
     ui.actions.innerHTML = '';
     const closeBtn = el('button', { type: 'button', class: 'pp-btn', text: 'Close', onclick: close });
@@ -658,12 +788,17 @@ export function createPlayerPanel(shell, callbacks = {}) {
   function exportData() {
     const stats = activeStats();
     if (!stats) return;
+    const entry = view === 'player' ? index.playerById(pid) : null;
     const payload = {
       exported: new Date().toISOString(),
       view,
       team,
       player: view === 'player' ? pid : null,
       filters: { ...filters },
+      horizon: {
+        mode: horizonMode,
+        untilSeconds: horizonMode === 'sofar' && Number.isFinite(nowSecs) ? Math.round(nowSecs) : null,
+      },
       zone: selectedZone,
       attempts: stats.attempts,
       success: stats.success,
@@ -677,7 +812,9 @@ export function createPlayerPanel(shell, callbacks = {}) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `dribbles-${view === 'player' ? (index.playerById(pid)?.name ?? 'player') : (team === 0 ? 'home' : 'away')}.json`;
+    // Feed names can carry characters that break a file name; keep it plain.
+    const who = (entry?.label ?? (team === 0 ? 'home' : 'away')).replace(/[^\p{L}\p{N} .-]+/gu, '-');
+    a.download = `dribbles-${who}.json`;
     document.body.append(a);
     a.click();
     a.remove();
@@ -704,6 +841,7 @@ export function createPlayerPanel(shell, callbacks = {}) {
     view = 'team';
     selectedZone = null;
     compare = false;
+    clockEl = null;
     callbacks.onSelection?.(null);
     callbacks.onZoneSelection?.(null);
   }
@@ -731,6 +869,17 @@ export function createPlayerPanel(shell, callbacks = {}) {
   shell.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') close();
   });
+  // A live update deferred while focus was inside a rebuilt section catches
+  // up when focus leaves it — but not when tabbing between its own controls.
+  function catchUpLive(ev) {
+    if (!pendingLive) return;
+    const next = ev.relatedTarget;
+    if (next && (ui.body.contains(next) || ui.actions.contains(next))) return;
+    pendingLive = false;
+    if (isOpen() && index) render();
+  }
+  ui.body.addEventListener('focusout', catchUpLive);
+  ui.actions.addEventListener('focusout', catchUpLive);
 
   return {
     setIndex(nextIndex, nextTeam = 0) {
@@ -739,7 +888,11 @@ export function createPlayerPanel(shell, callbacks = {}) {
       pid = null;
       selectedZone = null;
       compare = false;
-      filters = { period: 'all', state: 'all', player: 'all' };
+      filters = { period: 'all', state: 'all' };
+      // Unknown clock until the app reports one; a fresh match never inherits
+      // the previous match's horizon.
+      nowSecs = Infinity;
+      lastHorizon = undefined;
       if (isOpen()) render();
     },
     open,
@@ -747,8 +900,9 @@ export function createPlayerPanel(shell, callbacks = {}) {
     isOpen,
     selectPlayer,
     setZone,
-    /** Pitch layer asks the panel to highlight a clicked zone. */
-    highlightZone: (zone) => { selectedZone = zone; if (isOpen()) render(); },
+    /** Live sim clock (match seconds) — keeps "So far" stats current. */
+    setNow,
+    setHorizonMode,
     get selection() {
       if (!index) return null;
       if (view === 'player' && pid) return { scope: 'player', pid, team };
@@ -756,18 +910,12 @@ export function createPlayerPanel(shell, callbacks = {}) {
     },
     get selectedZone() { return selectedZone; },
     get view() { return view; },
+    get horizonMode() { return horizonMode; },
     setTeam(nextTeam) {
       if (team === nextTeam) return;
       team = nextTeam;
       pid = null;
       if (isOpen()) render();
-    },
-    /** Re-render after a filter changed elsewhere (kept for app.js). */
-    refresh: () => { if (isOpen()) render(); },
-    drawDribbleLayerFor(ctx, toScreen, alpha) {
-      const stats = activeStats();
-      if (!stats) return;
-      drawDribbleLayer(ctx, toScreen, stats, team, { alpha, hoverZone: null });
     },
     /** Current selection for the pitch layer (team or player scope). */
     layerStats() {

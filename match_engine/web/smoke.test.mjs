@@ -29,6 +29,8 @@ test('the effects bar, the panel shell and the view controls are all present', (
     assert.ok(html.includes(`id="${id}"`), `index.html lacks #${id}`);
   }
   assert.match(html, /role="tablist"/, 'panel tabs exist in the markup');
+  const horizons = [...html.matchAll(/data-horizon="([\w-]+)"/g)].map((m) => m[1]).sort();
+  assert.deepEqual(horizons, ['sofar', 'whole'], 'the stats-window toggle exists under the pitch');
   assert.match(html, /app\.js\?v=\d+/, 'the module is cache-busted');
 });
 

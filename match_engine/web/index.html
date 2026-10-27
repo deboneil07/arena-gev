@@ -213,6 +213,20 @@
     #view-controls .val { color: #c9d1d9; font-variant-numeric: tabular-nums; min-width: 42px; }
     #view-controls .vc-sep { width: 1px; height: 14px; background: #30363d; }
 
+    /* Two-state segmented control: stats window in the panel and under the
+       pitch. Shares one look so the two placements read as one control. */
+    .seg { display: inline-flex; background: #161b22; border: 1px solid #21262d;
+      border-radius: 8px; padding: 3px; gap: 3px; }
+    .seg-btn { border: 0; background: transparent; color: #8b949e; font-size: 12px;
+      padding: 5px 12px; line-height: 1.2; border-radius: 6px; }
+    .seg-btn:hover { color: #e6edf3; background: transparent; }
+    .seg-btn[aria-pressed="true"] { background: #2f81f7; color: #fff; font-weight: 600; }
+    #view-controls .seg-btn { font-size: 11.5px; padding: 4px 10px; }
+    /* The slide-in panel carries the same control; the overlaid pitch twin
+       would otherwise sit half-clipped under it. */
+    .vc-window { display: flex; align-items: center; gap: 16px; }
+    body:has(#player-panel.is-open) .vc-window { visibility: hidden; }
+
     /* ── Player context menu (pitch click) ───────────────────── */
     #player-context {
       position: absolute; z-index: 30; min-width: 214px;
@@ -257,6 +271,11 @@
     .pp-close:hover { color: #e6edf3; background: #21262d; }
     .pp-context { padding: 8px 14px 0; font-size: 12px; color: #8b949e;
       font-variant-numeric: tabular-nums; }
+    .pp-scope { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .pp-scope-clock { font-size: 11px; color: #6e7681; font-variant-numeric: tabular-nums; }
+    .pp-feed-empty { border-color: rgba(255, 190, 90, 0.35); }
+    .pp-feed-title { font-size: 12.5px; font-weight: 600; color: #e6edf3; margin-bottom: 4px; }
+    .pp-feed-body { font-size: 12px; color: #8b949e; line-height: 1.55; }
     .pp-body { flex: 1; overflow-y: auto; padding: 10px 14px 14px;
       display: flex; flex-direction: column; gap: 12px; }
     .pp-body::-webkit-scrollbar { width: 8px; }
@@ -485,6 +504,13 @@
             aria-label="Dribble zone layer opacity" />
           <span class="val" id="zone-alphaval">55%</span>
         </label>
+        <div class="vc-window">
+          <span class="vc-sep" aria-hidden="true"></span>
+          <div class="seg" role="group" aria-label="Stats time window">
+            <button type="button" class="seg-btn" data-horizon="sofar" aria-pressed="true">So far</button>
+            <button type="button" class="seg-btn" data-horizon="whole" aria-pressed="false">Whole match</button>
+          </div>
+        </div>
       </div>
     </div>
     <aside id="sidebar">
@@ -534,6 +560,6 @@
     <span><i class="heat-swatch" style="background:linear-gradient(90deg, rgba(80,220,140,0.75), rgba(230,199,74,0.75), rgba(239,75,75,0.75))"></i>Zones · dribble volume</span>
   </div>
 
-  <script type="module" src="./app.js?v=18"></script>
+  <script type="module" src="./app.js?v=19"></script>
 </body>
 </html>

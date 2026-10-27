@@ -133,8 +133,22 @@ const dribblePanel = createPlayerPanel(document.getElementById('player-panel'), 
     syncEffectButtons();
     setStatus('Dribble zones shown — click a zone on the pitch to filter the panel.');
   },
+  onHorizonChange: (mode) => syncHorizonButtons(mode),
   status: setStatus,
 });
+
+// The stats-window toggle under the pitch mirrors the panel's own control:
+// one mode, two places to reach it.
+const horizonButtons = [...document.querySelectorAll('[data-horizon]')];
+function syncHorizonButtons(mode) {
+  for (const button of horizonButtons) {
+    button.setAttribute('aria-pressed', String(button.dataset.horizon === mode));
+  }
+}
+for (const button of horizonButtons) {
+  button.addEventListener('click', () => dribblePanel?.setHorizonMode(button.dataset.horizon));
+}
+syncHorizonButtons(dribblePanel?.horizonMode ?? 'sofar');
 
 /** Whole-match analysis log for the freshly loaded match (schema v1). */
 function buildDribbleIndex() {
@@ -550,9 +564,9 @@ function drawOverlays(players, possessionTeam, setPieceActive, dt, ball) {
     }
   }
 
-  // Dribble zones: a whole-match layer (static, seek-safe) drawn for the
-  // panel's current scope — the followed team by default, one player once
-  // a player is selected.
+  // Dribble zones: drawn for the panel's current scope — the followed team
+  // by default, one player once a player is selected — and time-aware, so
+  // zones and markers fill in as the match plays.
   if (effects.isVisible('dribbles')) {
     const stats = dribblePanel?.layerStats();
     if (stats) {
@@ -712,7 +726,11 @@ function startEngine(xml) {
   els.matchInfo.textContent = meta.length ? meta.join(' · ') : '';
   // Fresh match → fresh whole-match dribble index; the panel resets with it.
   hidePlayerMenu();
+  hoveredPlayer = null;
+  hoverZone = null;
   buildDribbleIndex();
+  updateClockLabel();
+  updateStats();
   setStatus(`${engine.get_duration_secs().toFixed(0)} s of match loaded`);
   playing = true;
   els.playpause.textContent = '⏸ Pause';
@@ -938,6 +956,9 @@ function render(dt = 0) {
   // only, but the pass fan, corridor interception and run channels all need
   // real vx/vy to predict where bodies will be.
   const simNow = typeof engine.get_sim_time === 'function' ? engine.get_sim_time() : 0;
+  // The analysis panel shows "so far" stats by default: hand it the clock
+  // every frame. It re-renders only when a dribble boundary is crossed.
+  dribblePanel?.setNow(simNow);
   for (const p of players) {
     const key = `${p.team}:${p.shirt}`;
     const prev = playerVelocity.get(key);
@@ -1299,6 +1320,13 @@ function updateStats() {
   els.possval.textContent = `${(ph * 100).toFixed(0)}%`;
 }
 
+/** HUD match clock — shared by playback and seeks, so they never disagree. */
+function updateClockLabel() {
+  if (!engine) return;
+  const t = engine.get_sim_time();
+  els.timer.textContent = `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+}
+
 // ── Momentum strip (sidebar canvas) ──────────────────────────
 // Cumulative model-estimate threat per team; goals/shot/card ticks mark it.
 let lastMomentumDraw = 0;
@@ -1389,11 +1417,7 @@ function loop(now) {
       }
       if (accumulator > FIXED_DT * 8) accumulator = 0;
 
-      const t = engine.get_sim_time();
-      const mins = String(Math.floor(t / 60)).padStart(2, '0');
-      const secs = String(Math.floor(t % 60)).padStart(2, '0');
-      els.timer.textContent = `${mins}:${secs}`;
-
+      updateClockLabel();
       updateEvents();
       updateStats();
 
@@ -1414,8 +1438,13 @@ function loop(now) {
 }
 for (const button of effectButtons) {
   button.addEventListener('click', () => {
-    effects.toggleEnabled(button.dataset.effect);
+    const key = button.dataset.effect;
+    effects.toggleEnabled(key);
     syncEffectButtons();
+    // Turning on a layer that has nothing to draw deserves an explanation.
+    if (key === 'dribbles' && effects.isEnabled('dribbles') && dribbleIndex && !dribbleIndex.hasDribbleData) {
+      setStatus('This feed records no take-on or carry events — dribble zones and stats stay empty.');
+    }
   });
 }
 if (els.shuffle) {
@@ -1469,7 +1498,7 @@ function showPlayerMenu(player, ev) {
   const title = document.createElement('div');
   title.className = 'ctx-title';
   const strong = document.createElement('strong');
-  strong.textContent = (entry && entry.name) || `#${player.shirt}`;
+  strong.textContent = entry ? entry.label : `#${player.shirt}`;
   title.appendChild(strong);
   title.appendChild(document.createTextNode(
     `${player.team === 0 ? 'Home' : 'Away'} · #${player.shirt}`,
@@ -1711,6 +1740,10 @@ function seekTo(target, message) {
   lastPasser[1] = { id: '', pos: null };
   els.feed.innerHTML = '';
   setStatus(message ?? `Jumped to ${Math.floor(clamped / 60)} min`);
+  // A seek rebuilds the engine; the HUD must show the new point immediately
+  // (it used to wait for playback to resume, leaving the clock stale).
+  updateClockLabel();
+  updateStats();
 }
 els.xmlpath.addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter') loadFromPath();
