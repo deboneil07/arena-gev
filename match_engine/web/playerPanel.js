@@ -80,6 +80,9 @@ export function createPlayerPanel(shell, callbacks = {}) {
   let clockText = '';
   let pendingLive = false;   // a stat boundary was crossed while focus was inside the body
   let tooltipTimer = 0;
+  let liveVision = null;      // latest live vision snapshot from the app
+  let liveVisionBody = null;  // reused DOM node inside the player view
+  let liveVisionSig = '';
 
   /** The panel is open when it carries `is-open` (CSS drives the slide). */
   const isOpen = () => shell.classList.contains('is-open');
@@ -680,6 +683,7 @@ export function createPlayerPanel(shell, callbacks = {}) {
         metricRow(`Shot within ${POST_SHOT_WINDOW}s`, pctText(stats.shotRate), pct.shotRate, index.stars(pct.shotRate),
           'Dribbles after which the same player shot inside the window'),
       ),
+      visionBlock(),
       el('div', { class: 'pp-facts' },
         el('span', {}, el('strong', { text: `${stats.takeonWins}/${stats.takeons}` }), ' take-ons won'),
         el('span', {}, el('strong', { text: String(stats.lost) }), ' dribbles lost'),
@@ -699,6 +703,42 @@ export function createPlayerPanel(shell, callbacks = {}) {
     ];
   }
 
+  function renderVisionBody(data) {
+    if (!liveVisionBody) return;
+    if (data && pid && data.pid !== pid) data = null;
+    const sig = data
+      ? `${data.pid}:${Math.round((data.coverage ?? 0) * 100)}:${data.visible ?? 0}:${data.blind ?? 0}:${data.best?.shirt ?? ''}:${Math.round((data.best?.p ?? 0) * 100)}`
+      : 'none';
+    if (sig === liveVisionSig) return;
+    liveVisionSig = sig;
+    liveVisionBody.innerHTML = '';
+    if (!data) {
+      liveVisionBody.append(el('span', { class: 'pp-empty-body', text: 'Not on the ball right now.' }));
+      return;
+    }
+    liveVisionBody.append(
+      el('span', {}, el('strong', { text: `${Math.round((data.coverage ?? 0) * 100)}%` }), ' coverage'),
+      el('span', {}, el('strong', { text: String(data.visible ?? 0) }), ' visible'),
+      el('span', {}, el('strong', { text: String(data.blind ?? 0) }), ' blind'),
+    );
+    if (data.best && Number.isFinite(data.best.shirt)) {
+      liveVisionBody.append(el('span', {},
+        el('strong', { text: `#${data.best.shirt} ${Math.round((data.best.p ?? 0) * 100)}%` }),
+        ' best option'));
+    }
+  }
+
+  function visionBlock() {
+    liveVisionBody = el('div', { class: 'pp-facts' });
+    renderVisionBody(liveVision);
+    return el('div', { class: 'pp-block' },
+      el('div', { class: 'pp-block-title' },
+        'Live vision ',
+        el('span', { class: 'hint', text: 'while this player is on the ball' })),
+      liveVisionBody,
+    );
+  }
+
   // ── Render ────────────────────────────────────────────────────
   function activeStats() {
     if (!index) return null;
@@ -709,6 +749,8 @@ export function createPlayerPanel(shell, callbacks = {}) {
 
   function render() {
     if (!index) return;
+    liveVisionBody = null;
+    liveVisionSig = '';
     pendingLive = false;
     // The live view re-renders at stat boundaries only; remember which one
     // this render shows so setNow can tell whether anything has moved.
@@ -903,6 +945,13 @@ export function createPlayerPanel(shell, callbacks = {}) {
     /** Live sim clock (match seconds) — keeps "So far" stats current. */
     setNow,
     setHorizonMode,
+    setLiveVision(data) {
+      liveVision = data ?? null;
+      if (view === 'player' && isOpen()) {
+        if (liveVision && pid && liveVision.pid !== pid) liveVision = null;
+        renderVisionBody(liveVision);
+      }
+    },
     get selection() {
       if (!index) return null;
       if (view === 'player' && pid) return { scope: 'player', pid, team };

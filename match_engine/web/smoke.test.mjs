@@ -21,6 +21,12 @@ test('every element app.js looks up exists in index.html', () => {
   assert.deepEqual(missing, [], `missing ids: ${missing.join(', ')}`);
 });
 
+test('analysis presets and the lane-memory control are present', () => {
+  const presets = [...html.matchAll(/data-preset="([\w-]+)"/g)].map((m) => m[1]).sort();
+  assert.deepEqual(presets, ['all', 'broadcast', 'clean', 'tactical']);
+  assert.match(html, /id="lane-hold"/);
+});
+
 test('the effects bar, the panel shell and the view controls are all present', () => {
   const buttons = [...html.matchAll(/data-effect="([\w-]+)"/g)].map((m) => m[1]);
   assert.deepEqual([...buttons].sort(), EFFECTS.map((e) => e.key).sort());

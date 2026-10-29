@@ -644,3 +644,22 @@ test('live updates wait for an open control instead of rebuilding under it', () 
   shell.querySelector('.pp-actions').fire('focusout', { relatedTarget: null });
   assert.equal(attempts(), '10', 'catch-up after leaving the footer');
 });
+
+test('live vision block updates for the on-ball player only', () => {
+  const { panel, shell } = makePanel();
+  panel.open('player', { team: 0, player: 'h10' });
+  panel.setLiveVision({
+    pid: 'h10', coverage: 0.62, visible: 5, blind: 3,
+    best: { shirt: 9, p: 0.8 },
+  });
+  const body = shell.querySelector('.pp-body');
+  const text = body.textContent;
+  assert.match(text, /Live vision/);
+  assert.match(text, /62%/);
+  assert.match(text, /5/);
+  assert.match(text, /#9 80%/);
+
+  panel.selectPlayer('h9');
+  panel.setLiveVision({ pid: 'h10', coverage: 0.62, visible: 5, blind: 3, best: null });
+  assert.match(shell.querySelector('.pp-body').textContent, /Not on the ball right now\./);
+});

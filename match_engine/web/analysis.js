@@ -17,6 +17,9 @@ export const ROLE = Object.freeze({
   FWD: 4,
 });
 
+/** Pitch extents in engine metres (origin at the centre spot). */
+export const PITCH = Object.freeze({ halfLength: 52.5, halfWidth: 34 });
+
 /**
  * Tuning constants. These are intentionally in one place so they can be
  * sampled against the bundled fixtures and adjusted until the overlays are
@@ -61,6 +64,14 @@ export const ANALYSIS = Object.freeze({
   fanInterceptMargin: 0.35, // seconds the ball must beat a defender by
   fanDefenderAccel: 4.5, // m/s² assumed for a reacting defender
 
+  // Attacking lanes: four equal bands across the pitch width, drawn from
+  // halfway to the goal being attacked. The projection horizon is short
+  // enough to read as "where he is going next", not a full sprint model.
+  attackLaneCount: 4,
+  attackLaneHorizon: 1.8, // seconds of velocity + acceleration projection
+  attackLaneCarrierRadius: 3.5, // metres from ball to identify the carrier
+  attackLaneOptionLimit: 12, // score every viable receiver before bucketing
+
   // Space control: local grid around the threat, cells the attacker wins by
   // more than this margin (seconds) over the nearest defender.
   spaceGridHalf: 4.0, // metres each way
@@ -72,6 +83,32 @@ export const ANALYSIS = Object.freeze({
   xtGridCols: 12,
   xtGridRows: 8,
 });
+
+/**
+ * Index of the horizontal channel containing `y`, 0 = bottom touchline and
+ * `count - 1` = top touchline. Four 17 m bands by default.
+ */
+export function laneIndex(y, count = ANALYSIS.attackLaneCount) {
+  const n = Math.max(1, Math.floor(count) || 1);
+  const width = (2 * PITCH.halfWidth) / n;
+  const value = Number.isFinite(y) ? y : 0;
+  const i = Math.floor((value + PITCH.halfWidth) / width);
+  return Math.max(0, Math.min(n - 1, i));
+}
+
+/** World-space extents of one horizontal channel. */
+export function laneBand(index, count = ANALYSIS.attackLaneCount) {
+  const n = Math.max(1, Math.floor(count) || 1);
+  const i = Math.max(0, Math.min(n - 1, Math.floor(index) || 0));
+  const width = (2 * PITCH.halfWidth) / n;
+  const y0 = -PITCH.halfWidth + i * width;
+  return { index: i, y0, y1: y0 + width, centerY: y0 + width / 2, width };
+}
+
+/** Centre line of a horizontal channel. */
+export function laneCenterY(index, count = ANALYSIS.attackLaneCount) {
+  return laneBand(index, count).centerY;
+}
 
 const SHAPE_LABELS = Object.freeze({
   '4-4-2': '4-4-2',
@@ -623,7 +660,7 @@ export function arrivalTime(dist, maxSpeed = 8.0, maxAccel = 6.0) {
 // 2–3 candidate passes, each scored by corridor clearance (defenders'
 // velocity-aware interception), receiver control, and xT gain. Replaces the
 // single static lane with a small calibrated set.
-export function passFan(ball, candidates, opponents, dir) {
+export function passFan(ball, candidates, opponents, dir, limit = ANALYSIS.fanMaxOptions) {
   if (!ball || !candidates?.length) return [];
   const scored = [];
   for (const c of candidates) {
@@ -657,7 +694,7 @@ export function passFan(ball, candidates, opponents, dir) {
     scored.push({ from: { ...ball }, to: reception, player: c, p, clearance, value, pressure: receiverPressure });
   }
   scored.sort((a, b) => b.p - a.p);
-  return scored.slice(0, ANALYSIS.fanMaxOptions);
+  return scored.slice(0, Math.max(0, limit));
 }
 
 /**
@@ -806,24 +843,130 @@ export function splitUnits(teamPlayers, dir = 1) {
 }
 
 /**
- * Candidate receivers for the passing-lane overlay: teammates (excluding the
- * carrier) within the pass range, best-first by passFan score. Pure helper so
- * the renderer and tests share one definition.
+ * Live state of the four attacking channels.
+ *
+ * Active only for the team in possession, once the ball is on the attacking
+ * half. Each lane combines:
+ * - `momentum`: the carrier's velocity + acceleration projected ~1.8 s ahead,
+ *   so the lane he is actually heading into burns brightest;
+ * - `option`: the best viable pass into that lane (`passFan` completion
+ *   probability), so the lanes also answer "where can he play it?";
+ * - a small baseline on the carrier's current lane.
+ *
+ * Pure: the renderer only supplies snapshots and draws the result.
  */
-export function passingLaneCandidates(players, ball, team, dir) {
-  if (!players?.length || !ball) return [];
+export function attackLaneState(players, ball, team, dir, opponents = null, carrier = null) {
+  const empty = {
+    active: false,
+    team,
+    dir: dir === -1 ? -1 : 1,
+    carrier: null,
+    carrierLane: null,
+    projectedLane: null,
+    projected: null,
+    lanes: [],
+    bestPass: null,
+    progress: -Infinity,
+  };
+  if (!players?.length || !ball) return empty;
+  const attackDir = dir === -1 ? -1 : 1;
   const teamPlayers = players.filter((p) => p.team === team);
-  if (teamPlayers.length === 0) return [];
-  // Carrier = nearest teammate to the ball.
-  let carrier = null;
-  let bestD = Infinity;
-  for (const p of teamPlayers) {
-    const d = Math.hypot(p.x - ball.x, p.y - ball.y);
-    if (d < bestD) { bestD = d; carrier = p; }
+  if (teamPlayers.length === 0) return empty;
+
+  let man = carrier;
+  if (!man) {
+    let bestD = Infinity;
+    for (const p of teamPlayers) {
+      const d = Math.hypot(p.x - ball.x, p.y - ball.y);
+      if (d < bestD) { bestD = d; man = p; }
+    }
+    if (bestD > ANALYSIS.attackLaneCarrierRadius) return empty;
   }
-  if (!carrier || bestD > 2.5) return [];
-  const candidates = teamPlayers.filter((p) => p !== carrier);
-  return passFan(ball, candidates, players.filter((p) => p.team !== team), dir);
+
+  const opps = opponents ?? players.filter((p) => p.team !== team);
+  const options = passFan(
+    ball,
+    teamPlayers.filter((p) => p !== man),
+    opps,
+    attackDir,
+    ANALYSIS.attackLaneOptionLimit,
+  );
+  const bestPass = options[0] ?? null;
+  const progress = ball.x * attackDir;
+  const carrierLane = laneIndex(man.y);
+  if (progress < 0) {
+    return { ...empty, carrier: man, carrierLane, bestPass, progress };
+  }
+
+  const t = ANALYSIS.attackLaneHorizon;
+  const vx = Number.isFinite(man.vx) ? man.vx : 0;
+  const vy = Number.isFinite(man.vy) ? man.vy : 0;
+  const ax = Number.isFinite(man.ax) ? man.ax : 0;
+  const ay = Number.isFinite(man.ay) ? man.ay : 0;
+  const projected = {
+    x: man.x + vx * t + 0.5 * ax * t * t,
+    y: man.y + vy * t + 0.5 * ay * t * t,
+  };
+  projected.y = Math.max(-PITCH.halfWidth, Math.min(PITCH.halfWidth, projected.y));
+  const projectedLane = laneIndex(projected.y);
+  const along = clamp01((vx * attackDir) / 6.5);
+  const cut = clamp01(Math.abs(vy) / 5.5);
+
+  const lanes = [];
+  for (let i = 0; i < ANALYSIS.attackLaneCount; i++) {
+    const band = laneBand(i);
+    let option = 0;
+    let target = null;
+    for (const o of options) {
+      if (laneIndex(o.to.y) !== i) continue;
+      const p = clamp01(o.p);
+      if (p > option) {
+        option = p;
+        target = {
+          x: o.to.x,
+          y: o.to.y,
+          shirt: o.player?.shirt ?? null,
+          team: o.player?.team ?? null,
+          p,
+        };
+      }
+    }
+    // Forward momentum dominates; a lateral cut still lights the lane it is
+    // heading into, but a pass backwards does not pretend to be an attack.
+    const momentum = i === projectedLane
+      ? clamp01(0.1 + 0.75 * along + 0.15 * cut)
+      : 0;
+    const carrierHere = i === carrierLane;
+    const score = clamp01(0.1 + 0.72 * momentum + 0.62 * option + (carrierHere ? 0.08 : 0));
+    lanes.push({
+      index: i,
+      y0: band.y0,
+      y1: band.y1,
+      centerY: band.centerY,
+      width: band.width,
+      x0: 0,
+      x1: attackDir * PITCH.halfLength,
+      score,
+      momentum,
+      option,
+      projected: i === projectedLane,
+      carrierLane: carrierHere,
+      target,
+    });
+  }
+
+  return {
+    active: true,
+    team,
+    dir: attackDir,
+    carrier: man,
+    carrierLane,
+    projectedLane,
+    projected,
+    lanes,
+    bestPass,
+    progress,
+  };
 }
 
 /**
@@ -920,6 +1063,23 @@ export function attackChannels(players, ball, team, dir, opponents) {
     }
 
     if (!best) continue;
+    // Where the run lands, expressed as an attacking channel. Only runs that
+    // finish on the attacking half get a lane landing; a drop back to build
+    // is not a threat.
+    const landingLane = laneIndex(best.y);
+    const landingBand = laneBand(landingLane);
+    const landing = best.x * dir >= 0
+      ? {
+          lane: landingLane,
+          y0: landingBand.y0,
+          y1: landingBand.y1,
+          centerY: landingBand.centerY,
+          x0: 0,
+          x1: dir * PITCH.halfLength,
+          x: best.x,
+          y: best.y,
+        }
+      : null;
     out.push({
       from: { x: p.x, y: p.y },
       to: { x: best.x, y: best.y },
@@ -928,6 +1088,7 @@ export function attackChannels(players, ball, team, dir, opponents) {
       gain: best.gain,
       margin: best.margin,
       curve: runCurveOffset({ x: p.x, y: p.y }, { x: best.x, y: best.y }, opps),
+      landing,
     });
   }
 
@@ -953,15 +1114,124 @@ function playerHash(player) {
 }
 
 /**
- * Individual vision profile. Every player gets a stable radius (16–28 m) and
- * half-angle (48–72°), so a narrow full-back and a wide-vision playmaker do
- * not share the same cone. Deterministic: same player, same profile.
+ * Role-based vision model.
+ *
+ * `near` is the player's immediate awareness (the familiar cone and blind
+ * circle); `reach` is the long view the raycast layer traces across the pitch.
+ * Keepers see almost the whole field, defenders read a long way, midfielders
+ * scan a little further than forwards, and forwards work in the tightest
+ * window. The per-player modifier is stable (team + shirt) and small, so two
+ * players in the same role still differ slightly without ever reading as
+ * random.
  */
+export const VISION = Object.freeze({
+  near: Object.freeze({
+    [ROLE.GK]: Object.freeze({ radius: 26, halfAngle: 80 }),
+    [ROLE.DEF]: Object.freeze({ radius: 24, halfAngle: 70 }),
+    [ROLE.MID]: Object.freeze({ radius: 22, halfAngle: 62 }),
+    [ROLE.FWD]: Object.freeze({ radius: 20, halfAngle: 54 }),
+    [ROLE.UNKNOWN]: Object.freeze({ radius: 22, halfAngle: 62 }),
+  }),
+  reach: Object.freeze({
+    [ROLE.GK]: Object.freeze({ distance: 58, halfAngle: 160 }),
+    [ROLE.DEF]: Object.freeze({ distance: 44, halfAngle: 110 }),
+    [ROLE.MID]: Object.freeze({ distance: 36, halfAngle: 100 }),
+    [ROLE.FWD]: Object.freeze({ distance: 30, halfAngle: 90 }),
+    [ROLE.UNKNOWN]: Object.freeze({ distance: 34, halfAngle: 100 }),
+  }),
+  // Angular falloff turns the hard sector into light: brightness peaks at the
+  // facing direction and decays toward the edge. Keepers keep a high edge
+  // value (near all-round peripheral awareness); each line forward steepens
+  // the beam until a striker is a tight torch.
+  falloff: Object.freeze({
+    [ROLE.GK]: Object.freeze({ power: 1.1, edge: 0.62 }),
+    [ROLE.DEF]: Object.freeze({ power: 1.5, edge: 0.42 }),
+    [ROLE.MID]: Object.freeze({ power: 2.0, edge: 0.28 }),
+    [ROLE.FWD]: Object.freeze({ power: 2.8, edge: 0.12 }),
+    [ROLE.UNKNOWN]: Object.freeze({ power: 2.0, edge: 0.28 }),
+  }),
+  playerVariation: 0.08, // ±8 % stable per-player modifier
+  blockerRadius: 0.9, // metres; a body is a disc on the sightline
+  ownBlockerRadius: 0.75, // the keeper's own men occlude a little softer
+  rays: 64, // uniform samples between the exact tangent rays
+  penumbra: 0.45, // metres of soft edge around each shadow
+});
+
+const DEG = Math.PI / 180;
+
+/**
+ * Relative brightness at `t` of the way from the facing direction to the
+ * cone edge. 1 at the focus, `edge` at the rim; `power` controls how fast it
+ * falls away in between.
+ */
+export function visionFalloff(t, power = 2.0, edge = 0.28) {
+  const x = Math.min(1, Math.abs(Number.isFinite(t) ? t : 0));
+  const p = Number.isFinite(power) && power > 0 ? power : 2.0;
+  const e = clamp01(edge);
+  return e + (1 - e) * Math.pow(1 - x, p);
+}
+
+/** Role-first vision profile: near cone plus the long raycast reach. */
 export function visionProfile(player) {
-  const h = playerHash(player);
-  const radius = 16 + ((h & 0x3ff) / 0x3ff) * 12;
-  const halfAngle = ((48 + ((h >>> 10) & 0x3ff) / 0x3ff * 24) * Math.PI) / 180;
-  return { radius, halfAngle };
+  const role = player && VISION.near[player.role] ? player.role : ROLE.UNKNOWN;
+  const near = VISION.near[role];
+  const reach = VISION.reach[role];
+  const falloff = VISION.falloff[role];
+  const h = playerHash(player ?? {});
+  const radiusScale = 1 + (((h & 0xff) / 0xff) * 2 - 1) * VISION.playerVariation;
+  const angleScale =
+    1 + ((((h >>> 8) & 0xff) / 0xff) * 2 - 1) * VISION.playerVariation * 0.6;
+  return {
+    role,
+    radius: near.radius * radiusScale,
+    halfAngle: near.halfAngle * DEG * angleScale,
+    reach: reach.distance * radiusScale,
+    longHalfAngle: reach.halfAngle * DEG * angleScale,
+    falloffPower: falloff.power,
+    falloffEdge: falloff.edge,
+  };
+}
+
+/** Where a player looks: best pass > heading > velocity > attacking direction. */
+function visionFacing(player, dir, focus = null) {
+  // The analytical focus (the best passing option) wins over the raw engine
+  // heading: players should look where the next pass is going, not at the
+  // ball at their feet.
+  if (
+    focus &&
+    Number.isFinite(focus.x) &&
+    Number.isFinite(focus.y) &&
+    Math.hypot(focus.x - player.x, focus.y - player.y) > 1.0
+  ) {
+    return Math.atan2(focus.y - player.y, focus.x - player.x);
+  }
+  if (Number.isFinite(player.heading) && Math.abs(player.heading) > 1e-6) {
+    return player.heading;
+  }
+  if (Math.hypot(player.vx || 0, player.vy || 0) > 0.2) {
+    return Math.atan2(player.vy || 0, player.vx || 0);
+  }
+  return dir > 0 ? 0 : Math.PI;
+}
+
+/**
+ * Sightline blockers. Opponents always block; a keeper is additionally
+ * screened by his own defenders (the bodies in front of him), which is why
+ * the GK's own-team shadow reads softer than an opponent's.
+ */
+export function visionBlockers(player, teammates, opponents) {
+  const blockers = [];
+  for (const o of opponents ?? []) {
+    if (!o || !Number.isFinite(o.x) || !Number.isFinite(o.y)) continue;
+    blockers.push({ x: o.x, y: o.y, radius: VISION.blockerRadius, own: false });
+  }
+  if (player && player.role === ROLE.GK) {
+    for (const t of teammates ?? []) {
+      if (!t || t === player || !Number.isFinite(t.x) || !Number.isFinite(t.y)) continue;
+      blockers.push({ x: t.x, y: t.y, radius: VISION.ownBlockerRadius, own: true });
+    }
+  }
+  return blockers;
 }
 
 /**
@@ -978,35 +1248,23 @@ export function visionCone(player, teammates, opponents, dir, focus = null) {
       radius: profile.radius,
       conePoints: [],
       blindConePoints: [],
+      coneFalloff: [],
       visible: [],
       blind: [],
       coverage: 0,
     };
   }
-  let facing = 0;
-  // The analytical focus (the best passing option) wins over the raw engine
-  // heading: players should look where the next pass is going, not at the
-  // ball at their feet.
-  if (
-    focus &&
-    Number.isFinite(focus.x) &&
-    Number.isFinite(focus.y) &&
-    Math.hypot(focus.x - player.x, focus.y - player.y) > 1.0
-  ) {
-    facing = Math.atan2(focus.y - player.y, focus.x - player.x);
-  } else if (Number.isFinite(player.heading) && Math.abs(player.heading) > 1e-6) {
-    facing = player.heading;
-  } else if (Math.hypot(player.vx || 0, player.vy || 0) > 0.2) {
-    facing = Math.atan2(player.vy || 0, player.vx || 0);
-  } else {
-    facing = dir > 0 ? 0 : Math.PI;
-  }
+  const facing = visionFacing(player, dir, focus);
   const { halfAngle, radius } = profile;
-  const segs = 12;
+  // 24 sectors keep the falloff smooth enough to read as light; the old 12
+  // left visible fan steps inside a wide keeper cone.
+  const segs = 24;
   const conePoints = [{ x: player.x, y: player.y }];
+  const coneFalloff = [];
   for (let i = 0; i <= segs; i++) {
     const a = facing - halfAngle + (2 * halfAngle * i) / segs;
     conePoints.push({ x: player.x + Math.cos(a) * radius, y: player.y + Math.sin(a) * radius });
+    coneFalloff.push(visionFalloff((a - facing) / halfAngle, profile.falloffPower, profile.falloffEdge));
   }
   conePoints.push({ x: player.x, y: player.y });
   // Blind sector = rest of the circle behind/around the cone.
@@ -1030,11 +1288,11 @@ export function visionCone(player, teammates, opponents, dir, focus = null) {
     while (diff < -Math.PI) diff += 2 * Math.PI;
     return Math.abs(diff) <= halfAngle;
   };
-  // A teammate behind a defender on the sightline is not actually visible.
+  // A teammate behind a body on the sightline is not actually visible.
+  const blockers = visionBlockers(player, teammates, opponents);
   const occluded = (q) => {
-    for (const o of opponents ?? []) {
-      if (!o || !Number.isFinite(o.x) || !Number.isFinite(o.y)) continue;
-      if (pointSegmentDistance(o, player, q) < 1.2) return true;
+    for (const b of blockers) {
+      if (pointSegmentDistance(b, player, q) < b.radius + 0.3) return true;
     }
     return false;
   };
@@ -1053,6 +1311,7 @@ export function visionCone(player, teammates, opponents, dir, focus = null) {
     halfAngle,
     radius,
     conePoints,
+    coneFalloff,
     blindConePoints,
     visible,
     blind,
@@ -1060,6 +1319,161 @@ export function visionCone(player, teammates, opponents, dir, focus = null) {
       ? visible.length / (visible.length + blind.length)
       : 0,
   };
+}
+
+/** Four-point wedge behind a blocker, from its silhouette out to the reach. */
+function shadowWedge(apex, blocker, tangent, nearEdge, reach) {
+  const a1 = blocker.angle - tangent;
+  const a2 = blocker.angle + tangent;
+  const point = (a, t) => ({ x: apex.x + Math.cos(a) * t, y: apex.y + Math.sin(a) * t });
+  return [point(a1, nearEdge), point(a1, reach), point(a2, reach), point(a2, nearEdge)];
+}
+
+/**
+ * Raycast long view: the lit polygon around a player, clipped by every
+ * blocking body, plus the shadow wedge each blocker casts. Exact tangent
+ * angles are added to the uniform arc samples, so shadow edges land on the
+ * blocker silhouette rather than between samples. Pure geometry — the
+ * renderer turns `polygon`, `sector` and `shadows` into the light/shadow
+ * layer.
+ */
+export function raycastVision(player, blockers, dir, focus = null, profile = null) {
+  const p = profile ?? visionProfile(player ?? {});
+  if (!player || !Number.isFinite(player.x) || !Number.isFinite(player.y)) {
+    return {
+      apex: null,
+      facing: 0,
+      reach: p.reach,
+      halfAngle: p.longHalfAngle,
+      polygon: [],
+      sector: [],
+      shadows: [],
+      falloff: [],
+    };
+  }
+  const apex = { x: player.x, y: player.y };
+  const facing = visionFacing(player, dir, focus);
+  const reach = p.reach;
+  const half = p.longHalfAngle;
+  const start = facing - half;
+  const end = facing + half;
+
+  // Only bodies inside the reach and clear of the player can matter.
+  const active = [];
+  for (const b of blockers ?? []) {
+    if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) continue;
+    const dx = b.x - apex.x;
+    const dy = b.y - apex.y;
+    const d = Math.hypot(dx, dy);
+    const r = Math.max(0.2, b.radius ?? VISION.blockerRadius);
+    if (d <= r + 1e-3 || d - r > reach) continue;
+    active.push({ ...b, dx, dy, d, r, angle: Math.atan2(dy, dx) });
+  }
+
+  const angles = [];
+  for (let i = 0; i <= VISION.rays; i++) {
+    angles.push(start + ((end - start) * i) / VISION.rays);
+  }
+  for (const b of active) {
+    const tangent = Math.asin(Math.min(1, b.r / b.d));
+    for (const a of [b.angle - tangent, b.angle + tangent]) {
+      if (a >= start - 1e-6 && a <= end + 1e-6) angles.push(a);
+    }
+  }
+  angles.sort((a, b) => a - b);
+
+  const hitDistance = (angle) => {
+    const ux = Math.cos(angle);
+    const uy = Math.sin(angle);
+    let nearest = reach;
+    for (const b of active) {
+      const proj = b.dx * ux + b.dy * uy;
+      if (proj <= 0) continue;
+      const perp2 = b.dx * b.dx + b.dy * b.dy - proj * proj;
+      const r2 = b.r * b.r;
+      if (perp2 >= r2) continue;
+      const t = proj - Math.sqrt(r2 - perp2);
+      if (t > 0 && t < nearest) nearest = t;
+    }
+    return nearest;
+  };
+
+  const polygon = [{ ...apex }];
+  const falloff = [1];
+  for (const a of angles) {
+    const t = hitDistance(a);
+    polygon.push({ x: apex.x + Math.cos(a) * t, y: apex.y + Math.sin(a) * t });
+    falloff.push(visionFalloff((a - facing) / half, p.falloffPower, p.falloffEdge));
+  }
+
+  const sector = [{ ...apex }];
+  for (let i = 0; i <= VISION.rays; i++) {
+    const a = start + ((end - start) * i) / VISION.rays;
+    sector.push({ x: apex.x + Math.cos(a) * reach, y: apex.y + Math.sin(a) * reach });
+  }
+
+  const shadows = [];
+  for (const b of active) {
+    const tangent = Math.asin(Math.min(1, b.r / b.d));
+    const nearEdge = Math.sqrt(Math.max(0, b.d * b.d - b.r * b.r));
+    const softTangent = Math.asin(Math.min(1, (b.r + VISION.penumbra) / b.d));
+    const softNear = Math.sqrt(
+      Math.max(0, b.d * b.d - (b.r + VISION.penumbra) * (b.r + VISION.penumbra)),
+    );
+    shadows.push({
+      points: shadowWedge(apex, b, tangent, nearEdge, reach),
+      penumbra: shadowWedge(apex, b, softTangent, softNear, reach),
+      own: Boolean(b.own),
+    });
+  }
+
+  return { apex, facing, reach, halfAngle: half, polygon, sector, shadows, falloff };
+}
+
+/**
+ * Offside-line usefulness. The line is a reference, not a fixture: it is
+ * dropped when it would describe nothing an analyst can act on.
+ *
+ * - `deep-back-line`: the second-last defender is camped within 15 m of the
+ *   goal he defends, so the line sits on the penalty box and there is no
+ *   space behind it to attack.
+ * - `line-at-ball`: the engine clamps the line to the ball when the ball is
+ *   beyond the back line; the ball marker already is the line.
+ * - `no-attacker-near`: no attacker within 18 m of the line, so it currently
+ *   constrains nobody.
+ */
+export const OFFSIDE = Object.freeze({
+  deepGoalDistance: 15.0, // metres from the defended goal
+  ballCoincidence: 2.5, // metres; line this close to the ball is the ball
+  attackerBand: 18.0, // metres; nearest attacker beyond this = no pressure
+});
+
+export function offsideLineVisible({ offsideX, players, possessionTeam, ball } = {}) {
+  if (possessionTeam !== 0 && possessionTeam !== 1) {
+    return { show: false, reason: 'no-possession' };
+  }
+  if (!Number.isFinite(offsideX)) return { show: false, reason: 'no-line' };
+  const dir = possessionTeam === 0 ? 1 : -1;
+  // Distance from the line to the goal the possession team attacks.
+  const goalDistance = 52.5 - offsideX * dir;
+  if (goalDistance < OFFSIDE.deepGoalDistance) {
+    return { show: false, reason: 'deep-back-line' };
+  }
+  if (ball && Number.isFinite(ball.x) && Math.abs(offsideX - ball.x) < OFFSIDE.ballCoincidence) {
+    return { show: false, reason: 'line-at-ball' };
+  }
+  const attackers = (players ?? []).filter(
+    (p) => p && p.team === possessionTeam && p.role !== ROLE.GK,
+  );
+  if (attackers.length > 0) {
+    let nearest = Infinity;
+    for (const p of attackers) {
+      const d = Math.abs(p.x - offsideX);
+      if (d < nearest) nearest = d;
+    }
+    if (nearest > OFFSIDE.attackerBand) return { show: false, reason: 'no-attacker-near' };
+  }
+  return { show: true, reason: 'open-play' };
 }
 
 /** Apply a role array to the current (transient) player snapshots. */

@@ -9,21 +9,28 @@ import {
   ROLE,
   applyRoles,
   attackChannels,
+  attackLaneState,
   formationLabel,
-  passingLaneCandidates,
+  laneIndex,
+  offsideLineVisible,
+  raycastVision,
+  visionBlockers,
   visionCone,
 } from './analysis.js';
 import {
   drawAnalysis,
   drawAttackChannels,
+  drawAttackLanes,
   drawCelebrationFx,
   drawEventFx,
+  drawFrozenFrame,
   drawHeatmap,
   drawOffsideLine,
-  drawPassingLanes,
   drawPassingNetwork,
   drawSubstitutionFx,
   drawVisionCone,
+  drawVisionField,
+  laneTargetHits,
 } from './overlays.js';
 import { createSubstitutionTracker } from './transitions.js';
 import { createCelebrationTracker, createFxTracker } from './sequences.js';
@@ -32,11 +39,14 @@ import { createHeatmap } from './heatmap.js';
 import { createDribbleIndex, formatClock, zoneOf } from './dribbles.js';
 import { drawDribbleLayer } from './dribbleOverlay.js';
 import { createPlayerPanel } from './playerPanel.js';
-import { createPassingLaneTracker } from './passingLanes.js';
+import { createAttackLaneTracker } from './attackLanes.js';
 import { createAttackChannelTracker } from './attackChannels.js';
 import { createMinimap } from './minimap.js';
 import { createHighlightTracker } from './highlights.js';
 import { createEffectController } from './effects.js';
+import { getVariant, resetVariants, setVariant, variantKeys, variantsOf } from './variants.js';
+import { fieldTheme } from './fieldThemes.js';
+import { PRESETS, clearStoredPreset, readStoredPreset, storePreset } from './presets.js';
 
 const ENTITY_STRIDE = 6;
 const PITCH_W_M = 105.0;
@@ -60,6 +70,11 @@ const els = {
   status: document.getElementById('status'),
   playpause: document.getElementById('playpause'),
   restart: document.getElementById('restart'),
+  freezeFrame: document.getElementById('freeze-frame'),
+  freezePrev: document.getElementById('freeze-prev'),
+  freezeNext: document.getElementById('freeze-next'),
+  labToggle: document.getElementById('lab-toggle'),
+  exportFrame: document.getElementById('export-frame'),
   file: document.getElementById('file'),
   speed: document.getElementById('speed'),
   speedval: document.getElementById('speedval'),
@@ -91,11 +106,22 @@ const els = {
   resetView: document.getElementById('reset-view'),
   zoneAlpha: document.getElementById('zone-alpha'),
   zoneAlphaVal: document.getElementById('zone-alphaval'),
+  laneHold: document.getElementById('lane-hold'),
+  laneHoldVal: document.getElementById('lane-holdval'),
+  networkDecay: document.getElementById('network-decay'),
+  networkDecayVal: document.getElementById('network-decayval'),
+  variantLab: document.getElementById('variant-lab'),
+  variantLabDetails: document.getElementById('variant-lab-details'),
+  laneTooltip: document.getElementById('lane-tooltip'),
+  analysisReadout: document.getElementById('analysis-readout'),
 };
 
 const ctx = els.canvas.getContext('2d');
 const effectButtons = Array.from(document.querySelectorAll('[data-effect]'));
 const effects = createEffectController();
+for (const button of effectButtons) {
+  if (button.title) button.title += ' · Shift-click to solo';
+}
 
 /** Keep the effect bar's pressed/current state in sync with the controller. */
 function syncEffectButtons() {
@@ -109,6 +135,34 @@ function syncEffectButtons() {
 }
 syncEffectButtons();
 
+const presetButtons = Array.from(document.querySelectorAll('[data-preset]'));
+function clearPresetState() {
+  for (const button of presetButtons) button.setAttribute('aria-pressed', 'false');
+  clearStoredPreset();
+}
+
+function applyPreset(name, options = {}) {
+  const keys = PRESETS[name];
+  if (!keys) return;
+  effects.setShuffle(false);
+  for (const effect of effects.effects) effects.setEnabled(effect.key, keys.includes(effect.key));
+  syncEffectButtons();
+  for (const button of presetButtons) {
+    button.setAttribute('aria-pressed', String(button.dataset.preset === name));
+  }
+  if (!options.silent) {
+    storePreset(name);
+    setStatus(`Preset: ${name === 'clean' ? 'clean pitch' : name}.`);
+  }
+}
+for (const button of presetButtons) {
+  button.setAttribute('aria-pressed', String(button.dataset.preset === 'all'));
+  button.addEventListener('click', () => applyPreset(button.dataset.preset));
+}
+const storedPreset = readStoredPreset();
+if (storedPreset) applyPreset(storedPreset, { silent: true });
+else applyPreset('tactical', { silent: true });
+
 // ── Dribble analysis: index, panel and pitch interaction state ─
 // The index is a whole-match, seek-safe snapshot built once per load; the
 // panel renders from it and reports intent (seek / selection) outward.
@@ -116,6 +170,8 @@ let dribbleIndex = null;
 let zoneAlpha = 0.55;
 let hoveredPlayer = null; // { team, shirt } of the body under the cursor
 let hoverZone = null; // zone under the cursor while the layer is visible
+let hoveredLaneTargetKey = '';
+let lastReadout = '';
 let panning = null; // { x, y, panX, panY, moved } during a drag
 
 const dribblePanel = createPlayerPanel(document.getElementById('player-panel'), {
@@ -131,6 +187,7 @@ const dribblePanel = createPlayerPanel(document.getElementById('player-panel'), 
   onToggleZones: () => {
     effects.setEnabled('dribbles', true);
     syncEffectButtons();
+    clearPresetState();
     setStatus('Dribble zones shown — click a zone on the pitch to filter the panel.');
   },
   onHorizonChange: (mode) => syncHorizonButtons(mode),
@@ -255,19 +312,20 @@ function pointerToCanvas(ev) {
 }
 
 function drawPitch() {
+  const palette = fieldTheme(getVariant('field'));
   // Dark, desaturated base.
-  ctx.fillStyle = '#14261a';
+  ctx.fillStyle = palette.base;
   ctx.fillRect(0, 0, els.canvas.width, els.canvas.height);
 
   // Mowing stripes.
-  ctx.fillStyle = 'rgba(255,255,255,0.025)';
+  ctx.fillStyle = palette.stripe;
   const stripeW = PITCH_PX_W / 12;
   for (let i = 0; i < 12; i += 2) {
     ctx.fillRect(OFFSET_X + i * stripeW, OFFSET_Y, stripeW, PITCH_PX_H);
   }
 
   // Pitch fill.
-  ctx.fillStyle = '#1a3322';
+  ctx.fillStyle = palette.pitch;
   ctx.fillRect(OFFSET_X, OFFSET_Y, PITCH_PX_W, PITCH_PX_H);
 
   ctx.strokeStyle = 'rgba(255,255,255,0.62)';
@@ -375,15 +433,134 @@ const highlighter = createHighlightTracker(
 );
 let offsideX = NaN;
 let offsideAlpha = 0;
+let offsideVisible = false;
+let offsideHold = 0;
 const OFFSIDE_SMOOTH_TAU = 0.35;
 const OFFSIDE_FADE_TAU = 0.25;
+const OFFSIDE_DWELL = 0.5;
 const substitutions = createSubstitutionTracker();
 const celebrations = createCelebrationTracker();
 const fx = createFxTracker();
 const momentum = createMomentumTracker();
 const passingNet = createPassingNetwork();
-const passingLanes = createPassingLaneTracker();
+const attackLanesFx = createAttackLaneTracker();
 const attackChannelsFx = createAttackChannelTracker();
+let networkPulse = null;
+
+const LAYER_LABELS = Object.freeze({
+  visionCone: 'Vision cone',
+  passLanes: 'Pass lanes',
+  runChannels: 'Run channels',
+  network: 'Passing network',
+  heatmap: 'Heatmap',
+  analysis: 'Analysis',
+  field: 'Field',
+});
+
+const VARIANT_HINTS = Object.freeze({
+  'visionCone:classic': 'Filled sight sector with blockers and sightlines.',
+  'visionCone:soft-wedge': 'Softer wedge and a faint long field; no sightlines.',
+  'visionCone:spotlight': 'Local pool of attention around the carrier only.',
+  'visionCone:minimal': 'Outline and facing ray only; no wash.',
+  'passLanes:classic': 'Original four bands with pass-probability pulses.',
+  'passLanes:pulse-free': 'Same bands, no travelling glow dots.',
+  'passLanes:corridor': 'Dashed corridor plus a target chip with shirt and completion %.',
+  'passLanes:ghost-trail': 'Bands with fading trailing echoes and no dots.',
+  'runChannels:classic': 'Curved run arrows with gold landings.',
+  'runChannels:lanes': 'Wide run corridors with no arrowheads.',
+  'runChannels:heat-landing': 'Only the landing zone glows; no run path.',
+  'runChannels:ghosts': 'Dotted trace plus fading arrival echoes.',
+  'runChannels:minimal': 'Thin trace without arrowheads or landing wash.',
+  'network:outlet': 'One strongest outlet wire per player in this possession.',
+  'network:mesh': 'Complete match-long team web, including zero-pass pairs.',
+  'heatmap:raster': 'Smoothed density raster.',
+  'heatmap:hexbin': 'Hexagonal density bins.',
+  'analysis:classic': 'Carrier ring, threat label, press ring and hull.',
+  'analysis:minimal': 'Carrier ring and hull without threat text or press ring.',
+  'field:classic': 'Dark, desaturated pitch.',
+  'field:broadcast': 'Brighter broadcast green.',
+  'field:night': 'Very dark night-match pitch.',
+});
+
+function buildVariantLab() {
+  const host = els.variantLab;
+  if (!host) return;
+  host.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'variant-lab-head';
+  const note = document.createElement('span');
+  note.textContent = 'Compare live, then keep the winner.';
+  const reset = document.createElement('button');
+  reset.type = 'button';
+  reset.className = 'variant-reset';
+  reset.textContent = 'Reset to recommended';
+  reset.addEventListener('click', () => {
+    resetVariants();
+    buildVariantLab();
+    setStatus('Variants reset to recommended defaults.');
+  });
+  head.appendChild(note);
+  head.appendChild(reset);
+  host.appendChild(head);
+  for (const layer of variantKeys()) {
+    const row = document.createElement('div');
+    row.className = 'variant-row';
+    const label = document.createElement('span');
+    label.className = 'variant-row-label';
+    label.textContent = LAYER_LABELS[layer] ?? layer;
+    row.appendChild(label);
+    const seg = document.createElement('div');
+    seg.className = 'seg';
+    seg.setAttribute('role', 'group');
+    seg.setAttribute('aria-label', LAYER_LABELS[layer] ?? layer);
+    for (const v of variantsOf(layer)) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'seg-btn';
+      btn.textContent = v.label;
+      btn.title = VARIANT_HINTS[`${layer}:${v.id}`] ?? v.label;
+      btn.dataset.layer = layer;
+      btn.dataset.variant = v.id;
+      btn.setAttribute('aria-pressed', String(getVariant(layer) === v.id));
+      btn.addEventListener('click', () => {
+        if (setVariant(layer, v.id)) {
+          seg.querySelectorAll('button').forEach((b) => {
+            b.setAttribute('aria-pressed', String(b.dataset.variant === v.id));
+          });
+          setStatus(`${LAYER_LABELS[layer] ?? layer}: ${v.label}`);
+        }
+      });
+      seg.appendChild(btn);
+    }
+    row.appendChild(seg);
+    host.appendChild(row);
+  }
+}
+buildVariantLab();
+
+function setLabOpen(open, persist = true) {
+  if (!els.variantLabDetails) return;
+  els.variantLabDetails.hidden = !open;
+  els.variantLabDetails.open = Boolean(open);
+  if (els.labToggle) els.labToggle.setAttribute('aria-pressed', String(open));
+  if (persist) {
+    try { localStorage.setItem('gev.lab', open ? '1' : '0'); } catch { /* ignore */ }
+  }
+}
+let labRequested = false;
+try {
+  labRequested = new URLSearchParams(globalThis.location?.search ?? '').get('lab') === '1'
+    || (typeof localStorage !== 'undefined' && localStorage.getItem('gev.lab') === '1');
+} catch { /* ignore */ }
+setLabOpen(labRequested, false);
+if (els.labToggle) {
+  els.labToggle.addEventListener('click', () => {
+    const next = Boolean(els.variantLabDetails?.hidden);
+    setLabOpen(next);
+    setStatus(next ? 'Variant lab opened.' : 'Variant lab hidden.');
+  });
+}
+
 // Player-only heatmap (minimap).
 const playerHeat = createHeatmap();
 let chosenPlayerShirt = null;
@@ -392,14 +569,14 @@ let lastPlayerHeatTeam = -1;
 let lastPlayerHeatSample = -Infinity;
 // Live overlays: sample the geometry at 10 Hz, resolve endpoints every frame.
 let lastLaneCompute = -Infinity;
-let lastLaneData = [];
+let lastAttackLanes = { active: false, lanes: [], bestPass: null };
 let lastChannelCompute = -Infinity;
 let lastChannelData = [];
 // Frame-to-frame velocity per team:shirt (the render buffer has no velocity).
 const playerVelocity = new Map();
 let visionAlpha = 0;
-let lastVisionCarrier = '';
 let lastVisionCone = null;
+let lastVisionField = null;
 let visionFocus = null;
 // Per-team last passer (link consecutive same-team rows into network edges).
 const lastPasser = [{ id: '', pos: null }, { id: '', pos: null }];
@@ -412,6 +589,10 @@ let sequencesPrimed = false;
 // Latest snapshots for sequence triggers (goal mob needs live positions).
 let lastPlayers = [];
 let lastBall = null;
+let frozenFrame = null;
+let possessionHistory = [];
+let freezeHistoryIndex = 0;
+let lastRenderedLanes = [];
 // Half-time renderer choreography (engine keeps placing the kickoff; we
 // overlay a walk-to-tunnel during the gap and snap to engine positions once
 // the kickoff set piece arms).
@@ -434,6 +615,8 @@ function resetOverlayState() {
   lastHeatSample = -Infinity;
   offsideX = NaN;
   offsideAlpha = 0;
+  offsideVisible = false;
+  offsideHold = 0;
   const possession = typeof engine?.get_possession_team === 'function'
     ? engine.get_possession_team()
     : -1;
@@ -513,6 +696,25 @@ function updateFollowedTeam(possessionTeam, dt) {
     } else {
       possessHold += dt;
       if (possessHold >= TEAM_SWITCH_DELAY) {
+        if (lastPlayers.length) {
+          possessionHistory.push({
+            time: typeof engine?.get_sim_time === 'function' ? engine.get_sim_time() : 0,
+            team: displayTeam,
+            ball: lastBall ? { x: lastBall.x, y: lastBall.y } : null,
+            players: lastPlayers.map((p) => ({ x: p.x, y: p.y, team: p.team, shirt: p.shirt })),
+            lanes: lastRenderedLanes.map((lane) => ({ ...lane })),
+            vision: lastVisionCone
+              ? {
+                  apex: { ...lastVisionCone.apex },
+                  facing: lastVisionCone.facing,
+                  radius: lastVisionCone.radius,
+                  conePoints: (lastVisionCone.conePoints ?? []).map((pt) => ({ x: pt.x, y: pt.y })),
+                }
+              : null,
+          });
+          if (possessionHistory.length > 4) possessionHistory.shift();
+          freezeHistoryIndex = 0;
+        }
         overlayTeamPrev = displayTeam;
         displayTeam = possessionTeam;
         possessHold = 0;
@@ -522,10 +724,11 @@ function updateFollowedTeam(possessionTeam, dt) {
         // is out of possession, and the streak resets on this switch).
         passingNet.breakRetention();
         // Transient overlays belong to the old team; never show them under
-        // the new team's colours during the crossfade.
-        passingLanes.reset();
+        // the new team's colours during the crossfade. Pass lanes are retained
+        // as fading ghosts so a turnover reads as a handover, not a vanish.
         attackChannelsFx.reset();
-        lastLaneData = [];
+        networkPulse = null;
+        lastAttackLanes = { active: false, lanes: [], bestPass: null };
         lastChannelData = [];
       }
     }
@@ -549,6 +752,36 @@ function updateTeamChip() {
   els.analysisTeamLabel.textContent = label;
 }
 
+function updateAnalysisReadout(hasCarrier, setPieceActive, possessionTeam) {
+  if (!els.analysisReadout) return;
+  let text = '';
+  if (setPieceActive) {
+    text = 'Set piece · overlays paused';
+  } else if (hasCarrier) {
+    const parts = [];
+    const carrier = lastAttackLanes.carrier;
+    if (carrier) parts.push(`<strong>#${carrier.shirt}</strong> on ball`);
+    const coverage = lastVisionCone
+      ? (lastVisionCone.visible?.length ?? 0) + (lastVisionCone.blind?.length ?? 0)
+      : 0;
+    if (coverage > 0 && Number.isFinite(lastVisionCone.coverage)) {
+      parts.push(`vision ${Math.round(lastVisionCone.coverage * 100)}%`);
+    }
+    const best = lastAttackLanes.bestPass;
+    if (best && best.player && Number.isFinite(best.player.shirt)) {
+      parts.push(`best option <strong>#${best.player.shirt}</strong> ${Math.round((best.p ?? 0) * 100)}%`);
+    }
+    text = parts.join('<span class="ro-sep">·</span>');
+  } else if (possessionTeam === 0 || possessionTeam === 1) {
+    text = `Ball in flight · lanes held ${attackLanesFx.hold.toFixed(1)}s`;
+  } else {
+    text = 'Neutral phase · analysis on hold';
+  }
+  if (text === lastReadout) return;
+  lastReadout = text;
+  els.analysisReadout.innerHTML = text;
+}
+
 /** Draw the overlay layer for the followed team (both sides while fading). */
 function drawOverlays(players, possessionTeam, setPieceActive, dt, ball) {
   const teams = [];
@@ -560,7 +793,7 @@ function drawOverlays(players, possessionTeam, setPieceActive, dt, ball) {
   const rect = { x: OFFSET_X, y: OFFSET_Y, w: PITCH_PX_W, h: PITCH_PX_H };
   if (effects.isVisible('heatmap')) {
     for (const { team, alpha } of teams) {
-      drawHeatmap(ctx, rect, heat[team], team, alpha);
+      drawHeatmap(ctx, rect, heat[team], team, alpha, getVariant('heatmap'));
     }
   }
 
@@ -583,38 +816,76 @@ function drawOverlays(players, possessionTeam, setPieceActive, dt, ball) {
   const netAlpha = Math.max(0, teamBlend);
   const stillInPossession = possessionTeam === displayTeam;
   if (effects.isVisible('network') && netAlpha > 0.01 && stillInPossession) {
-    const snap = passingNet.snapshot(8, displayTeam);
+    // The live squad seeds the node set: every shirt is a node, even before
+    // its first touch. Outlet mode keeps one wire per player in this
+    // possession; the Full mesh variant restores the match-long pair web.
+    const roster = players
+      .filter((p) => p.team === displayTeam)
+      .map((p) => ({ team: p.team, shirt: p.shirt, x: p.x, y: p.y }));
+    const networkMode = getVariant('network') === 'mesh' ? 'mesh' : 'outlet';
+    const simNow = typeof engine?.get_sim_time === 'function' ? engine.get_sim_time() : 0;
+    const snap = passingNet.snapshot(8, displayTeam, roster, networkMode, simNow);
     // Resolve nodes on the live bodies so links move with the players.
     const livePositions = new Map();
     for (const p of players) livePositions.set(`${p.team}:${p.shirt}`, { x: p.x, y: p.y });
-    drawPassingNetwork(ctx, toScreen, snap, netAlpha, displayTeam, livePositions);
+    let netPulse = null;
+    if (networkPulse) {
+      const age = simNow - networkPulse.start;
+      if (age >= 0 && age <= 0.7) netPulse = { ...networkPulse, progress: age / 0.7 };
+      else networkPulse = null;
+    }
+    drawPassingNetwork(
+      ctx, toScreen, snap, netAlpha, displayTeam, livePositions, netPulse,
+    );
   }
 
-  // Offside line: open play only, for the followed team in possession.
+  // Offside line: open play only, for the followed team in possession, and
+  // only while the line is actually informative (see offsideLineVisible).
   const rawOffside = typeof engine?.get_offside_line === 'function'
     ? engine.get_offside_line()
     : NaN;
-  const showOffside =
+  const offsideEligible =
     (possessionTeam === 0 || possessionTeam === 1) &&
     possessionTeam === displayTeam &&
     !setPieceActive &&
     Number.isFinite(rawOffside);
+  const offsideVerdict = offsideEligible
+    ? offsideLineVisible({ offsideX: rawOffside, players, possessionTeam, ball })
+    : { show: false, reason: 'gated' };
+  if (!offsideEligible) {
+    offsideVisible = false;
+    offsideHold = 0;
+  } else if (offsideVerdict.show !== offsideVisible) {
+    // A line that drifts in and out of usefulness must not strobe: hold the
+    // decision briefly before flipping, then let the alpha fade do the rest.
+    offsideHold += dt;
+    if (offsideHold >= OFFSIDE_DWELL) {
+      offsideVisible = offsideVerdict.show;
+      offsideHold = 0;
+    }
+  } else {
+    offsideHold = 0;
+  }
+  const showOffside = offsideEligible && offsideVisible;
   if (showOffside) {
     if (!Number.isFinite(offsideX)) offsideX = rawOffside;
     else offsideX += (rawOffside - offsideX) * (1 - Math.exp(-dt / OFFSIDE_SMOOTH_TAU));
   }
   offsideAlpha += ((showOffside ? 1 : 0) - offsideAlpha) *
     (1 - Math.exp(-dt / OFFSIDE_FADE_TAU));
-  if (!showOffside && offsideAlpha < 0.01) offsideAlpha = 0;
+  if (!showOffside && offsideAlpha < 0.01) {
+    offsideAlpha = 0;
+    offsideX = NaN;
+  }
   if (effects.isVisible('offside') && offsideAlpha > 0.01) {
     drawOffsideLine(ctx, toScreen, offsideX, offsideAlpha, OFFSET_Y, OFFSET_Y + PITCH_PX_H);
   }
 
   if (effects.isVisible('analysis')) {
     for (const { team, alpha } of teams) {
-      // The animated passing lanes + vision cone replace the static thread and
+      // The attacking lanes + vision cone replace the static thread and
       // triangle, so the analysis layer stays legible.
-      drawAnalysis(ctx, toScreen, players, team, alpha, ball, possessionTeam, { links: false });
+      drawAnalysis(ctx, toScreen, players, team, alpha, ball, possessionTeam, { links: false }, getVariant('analysis'));
     }
   }
 }
@@ -696,7 +967,7 @@ function startEngine(xml) {
   fx.reset();
   momentum.reset();
   passingNet.reset();
-  passingLanes.reset();
+  attackLanesFx.reset();
   attackChannelsFx.reset();
   playerHeat.reset();
   chosenPlayerShirt = null;
@@ -704,13 +975,14 @@ function startEngine(xml) {
   lastPlayerHeatTeam = -1;
   lastPlayerHeatSample = -Infinity;
   lastLaneCompute = -Infinity;
-  lastLaneData = [];
+  lastAttackLanes = { active: false, lanes: [], bestPass: null };
   lastChannelCompute = -Infinity;
   lastChannelData = [];
+  networkPulse = null;
   playerVelocity.clear();
   visionAlpha = 0;
-  lastVisionCarrier = '';
   lastVisionCone = null;
+  lastVisionField = null;
   visionFocus = null;
   if (highlighter) { highlighter.buffer.length = 0; }
   lastPasser[0] = { id: '', pos: null };
@@ -718,6 +990,14 @@ function startEngine(xml) {
   els.feed.innerHTML = '';
   els.splash.classList.remove('show');
   els.restart.disabled = false;
+  if (els.freezeFrame) els.freezeFrame.disabled = false;
+  if (els.exportFrame) els.exportFrame.disabled = false;
+  frozenFrame = null;
+  possessionHistory = [];
+  freezeHistoryIndex = 0;
+  lastRenderedLanes = [];
+  if (els.freezeFrame) els.freezeFrame.textContent = '❄ Freeze frame';
+  syncFreezeHistoryButtons();
   // Label the HUD with the match metadata straight from the engine.
   els.homeName.textContent = engine.get_home_team_name() || 'Home';
   els.awayName.textContent = engine.get_away_team_name() || 'Away';
@@ -865,7 +1145,27 @@ function triggerSequences() {
         passingNet.observePass(
           { ...prev.pos, team, shirt: prev.shirt },
           { ...p, shirt: p.shirt },
+          t,
         );
+        // Live pass feedback: one bead down the network wire and one pulse
+        // down the destination attacking lane.
+        networkPulse = {
+          a: `${team}:${prev.shirt}`,
+          b: `${team}:${p.shirt}`,
+          start: t,
+        };
+        if (team === displayTeam) {
+          const fromX = prev.pos.x;
+          const toX = p.x;
+          // The lanes only exist on the attacking half; a backward pass that
+          // starts or ends behind halfway must not spawn a bead off-channel.
+          // Do not gate on the transient carrier state: during flight the
+          // receiver is often still >3.5 m away, and the lanes dim for a beat.
+          const dir = team === 0 ? 1 : -1;
+          if (fromX * dir >= 0 && toX * dir >= 0) {
+            attackLanesFx.pulse(laneIndex(p.y), fromX, toX);
+          }
+        }
       }
       lastPasser[team] = { id: playerId, shirt: p.shirt, pos: { x: p.x, y: p.y } };
     } else if (team === 0 || team === 1) {
@@ -962,8 +1262,8 @@ function render(dt = 0) {
   for (const p of players) {
     const key = `${p.team}:${p.shirt}`;
     const prev = playerVelocity.get(key);
-    if (prev && simNow > prev.t + 1e-4) {
-      const dts = simNow - prev.t;
+    const dts = prev ? simNow - prev.t : 0;
+    if (prev && dts > 1e-4 && dts <= 0.5) {
       p.vx = (p.x - prev.x) / dts;
       p.vy = (p.y - prev.y) / dts;
       // A seek or a teleport must not become a 200 m/s sprint.
@@ -973,12 +1273,32 @@ function render(dt = 0) {
         p.vy = (p.vy / sp) * 12;
       }
       p.speed = Math.hypot(p.vx, p.vy);
+      // Smoothed acceleration feeds the attacking-lane projection. It is
+      // derived from frame-to-frame velocity, so a hard cut reads as a real
+      // change of direction rather than a teleport spike.
+      const rawAx = (p.vx - (Number.isFinite(prev.vx) ? prev.vx : 0)) / dts;
+      const rawAy = (p.vy - (Number.isFinite(prev.vy) ? prev.vy : 0)) / dts;
+      const k = 1 - Math.exp(-dts / 0.22);
+      const ax = (Number.isFinite(prev.ax) ? prev.ax : 0) + (rawAx - (Number.isFinite(prev.ax) ? prev.ax : 0)) * k;
+      const ay = (Number.isFinite(prev.ay) ? prev.ay : 0) + (rawAy - (Number.isFinite(prev.ay) ? prev.ay : 0)) * k;
+      p.ax = Math.max(-12, Math.min(12, ax));
+      p.ay = Math.max(-12, Math.min(12, ay));
     } else {
       p.vx = 0;
       p.vy = 0;
       p.speed = 0;
+      p.ax = 0;
+      p.ay = 0;
     }
-    playerVelocity.set(key, { x: p.x, y: p.y, t: simNow });
+    playerVelocity.set(key, {
+      x: p.x,
+      y: p.y,
+      t: simNow,
+      vx: p.vx,
+      vy: p.vy,
+      ax: p.ax,
+      ay: p.ay,
+    });
   }
   const bo = (total - 1) * ENTITY_STRIDE;
   const ball = { x: buffer[bo], y: buffer[bo + 1], z: buffer[bo + 2] };
@@ -1039,6 +1359,7 @@ function render(dt = 0) {
     ? players.filter((_, i) => !hiddenSlots.has(i) && !dismissed.has(i))
     : players;
 
+  try {
   updateFollowedTeam(possessionTeam, dt);
   updateTeamChip();
   // The zone layer and the team lens follow possession unless the analyst
@@ -1065,33 +1386,38 @@ function render(dt = 0) {
     const d = Math.hypot(p.x - ball.x, p.y - ball.y);
     if (d < bestD) { bestD = d; carrier = p; }
   }
-  const hasCarrier = carrier && bestD <= 2.5 && !setPieceActive;
+  // A dribbler can push the ball a few metres ahead of his boots; 3.5 m still
+  // identifies the man on the ball without latching onto a receiver mid-pass.
+  const hasCarrier = carrier && bestD <= 3.5 && !setPieceActive;
   const overlayDt = playing ? dt : 0;
 
-  // Vision cone: smooth fade in/out and reset when the carrier changes so the
-  // wedge never jumps across the pitch.
-  const carrierKey = hasCarrier ? `${carrierTeam}:${carrier.shirt}` : '';
-  if (carrierKey !== lastVisionCarrier) {
-    lastVisionCarrier = carrierKey;
-    visionAlpha = 0;
-  }
+  // Vision cone: smooth fade in/out. The alpha is deliberately continuous
+  // across a carrier change — resetting it on every pass blanked the field
+  // for a beat, which read as flicker at speed.
   visionAlpha += ((hasCarrier ? 1 : 0) - visionAlpha) * (1 - Math.exp(-overlayDt / 0.18));
+  const opponents = overlayPlayers.filter((p) => p.team !== carrierTeam);
   if (hasCarrier) {
-    // Passing options are re-scored at 10 Hz; endpoints resolve live.
+    // Passing options and lane scores are re-scored at 10 Hz; endpoints
+    // resolve live. The same call feeds the vision focus, so the cone and the
+    // channels always agree on the best available ball.
     if (simNow - lastLaneCompute >= 0.1) {
       lastLaneCompute = simNow;
-      lastLaneData = passingLaneCandidates(overlayPlayers, ball, carrierTeam, attackDir);
+      lastAttackLanes = attackLaneState(
+        overlayPlayers,
+        ball,
+        carrierTeam,
+        attackDir,
+        opponents,
+        carrier,
+      );
     }
     // Face the best available pass (not the ball at the carrier's feet), and
     // ease the focus so the cone never snaps between receivers.
     let focusTarget = null;
-    let bestP = 0.45;
-    for (const lane of lastLaneData) {
-      if ((lane.p ?? 0) > bestP) {
-        bestP = lane.p ?? 0;
-        const key = lane.player ? `${lane.player.team}:${lane.player.shirt}` : null;
-        focusTarget = (key && liveByKey.get(key)) || lane.to;
-      }
+    const bestPass = lastAttackLanes.bestPass;
+    if (bestPass && (bestPass.p ?? 0) > 0.45) {
+      const key = bestPass.player ? `${bestPass.player.team}:${bestPass.player.shirt}` : null;
+      focusTarget = (key && liveByKey.get(key)) || bestPass.to;
     }
     if (focusTarget) {
       if (!visionFocus) visionFocus = { x: focusTarget.x, y: focusTarget.y };
@@ -1104,14 +1430,49 @@ function render(dt = 0) {
       visionFocus = null;
     }
     const teammates = teamPlayers.filter((p) => p !== carrier);
-    const opponents = overlayPlayers.filter((p) => p.team !== carrierTeam);
     lastVisionCone = visionCone(carrier, teammates, opponents, attackDir, visionFocus);
+    // Long view: role-based reach, with every opponent (and, for a keeper,
+    // his own defenders) casting a shadow across it.
+    const blockers = visionBlockers(carrier, teammates, opponents);
+    lastVisionField = raycastVision(carrier, blockers, attackDir, visionFocus);
   } else {
-    lastLaneData = [];
+    lastAttackLanes = { active: false, lanes: [], bestPass: null };
+    // Keep the last field so it fades out with the cone instead of vanishing
+    // on the same frame the ball leaves the carrier.
     visionFocus = null;
   }
   if (effects.isVisible('visionCone') && lastVisionCone && visionAlpha > 0.01) {
-    drawVisionCone(ctx, toScreen, lastVisionCone, teamBlend * visionAlpha);
+    const visionFade = teamBlend * visionAlpha;
+    const visionVariant = getVariant('visionCone');
+    // The long raycast field belongs to the classic and soft variants; the
+    // spotlight and minimal skins are deliberately local to the carrier.
+    if (lastVisionField && (visionVariant === 'classic' || visionVariant === 'soft-wedge')) {
+      const fieldFade = visionVariant === 'soft-wedge' ? visionFade * 0.45 : visionFade;
+      drawVisionField(ctx, toScreen, lastVisionField, fieldFade, PX_PER_M, visionVariant);
+    }
+    drawVisionCone(ctx, toScreen, lastVisionCone, visionFade, visionVariant);
+  }
+
+  // Live vision for the player panel: only the man currently on the ball has
+  // a meaningful sight picture, so everyone else gets a clear "not on ball".
+  if (dribblePanel && typeof dribblePanel.setLiveVision === 'function') {
+    const entry = hasCarrier && carrier && dribbleIndex
+      ? dribbleIndex.playerByKey(carrier.team, carrier.shirt)
+      : null;
+    if (entry?.pid && lastVisionCone) {
+      const best = lastAttackLanes.bestPass;
+      dribblePanel.setLiveVision({
+        pid: entry.pid,
+        coverage: lastVisionCone.coverage,
+        visible: lastVisionCone.visible?.length ?? 0,
+        blind: lastVisionCone.blind?.length ?? 0,
+        best: best && best.player
+          ? { shirt: best.player.shirt, p: best.p }
+          : null,
+      });
+    } else {
+      dribblePanel.setLiveVision(null);
+    }
   }
 
   // Run channels are re-scored at 10 Hz and anchored to live runners.
@@ -1133,27 +1494,28 @@ function render(dt = 0) {
 
   // Pausing the sim freezes the transient overlays so an analyst can read
   // them, while the 10 Hz samplers keep the last geometry.
-  const laneSets = passingLanes.updateLive(overlayDt, lastLaneData, (lane) => {
-    const key = lane.player ? `${lane.player.team}:${lane.player.shirt}` : null;
-    const live = key ? liveByKey.get(key) : null;
-    return {
-      from: { x: ball.x, y: ball.y },
-      to: live ?? lane.to,
-    };
-  });
+  const laneSet = attackLanesFx.updateLive(overlayDt, lastAttackLanes);
+  lastRenderedLanes = laneSet.map((lane) => ({ ...lane, pulses: [] }));
   if (effects.isVisible('passingLanes')) {
-    drawPassingLanes(ctx, toScreen, laneSets, teamBlend);
+    drawAttackLanes(ctx, toScreen, laneSet, teamBlend, getVariant('passLanes'), displayTeam, (t) => {
+      const live = liveByKey.get(`${t.team}:${t.shirt}`);
+      return live ?? t;
+    });
   }
   const channelSet = attackChannelsFx.updateLive(overlayDt, lastChannelData, (ch) => {
     const key = ch.player ? `${ch.player.team}:${ch.player.shirt}` : null;
     return (key && liveByKey.get(key)) || ch.from;
   });
   if (effects.isVisible('attackChannels')) {
-    drawAttackChannels(ctx, toScreen, channelSet, teamBlend);
+    drawAttackChannels(ctx, toScreen, channelSet, teamBlend, getVariant('runChannels'));
   }
+
+  updateAnalysisReadout(hasCarrier, setPieceActive, possessionTeam);
 
   if (minimap) minimap.update(performance.now() / 1000);
   if (highlighter) highlighter.update(performance.now() / 1000, engine ? engine.get_sim_time() : 0);
+
+  if (frozenFrame) drawFrozenFrame(ctx, toScreen, frozenFrame, 0.9);
 
   // The walk-off / walk-on pair sits above the tactical wash but below the
   // ball, so a substitute crossing the touchline never hides the ball.
@@ -1163,7 +1525,22 @@ function render(dt = 0) {
   const celebFx = celebrations.update(players, ball, dt);
   if (celebFx) drawCelebrationFx(ctx, toScreen, celebFx);
   drawEventFx(ctx, toScreen, fx.update(dt));
+  } catch (overlayError) {
+    // A failed optional overlay must never hide the 22 bodies and the ball.
+    console.error('Overlay error', overlayError);
+    setStatus(`Overlay error: ${overlayError && overlayError.message ? overlayError.message : overlayError}`);
+    ctx.globalAlpha = 1;
+    ctx.filter = 'none';
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.setLineDash([]);
+  }
 
+  // Core entities are drawn outside the optional-overlay try block so a new
+  // analytical layer can fail without taking the match picture down with it.
+  ctx.globalAlpha = 1;
+  ctx.filter = 'none';
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.setLineDash([]);
   for (let i = 0; i < players.length; i++) {
     if (hiddenSlots.has(i)) continue;
     const p = players[i];
@@ -1437,10 +1814,23 @@ function loop(now) {
   }
 }
 for (const button of effectButtons) {
-  button.addEventListener('click', () => {
+  button.addEventListener('click', (ev) => {
     const key = button.dataset.effect;
+    if (ev.shiftKey) {
+      // Solo: one layer, everything else off. Shift-click again returns to All.
+      const solo = effects.effects.filter((effect) => effects.isEnabled(effect.key)).length === 1
+        && effects.isEnabled(key);
+      if (solo) for (const effect of effects.effects) effects.setEnabled(effect.key, true);
+      else for (const effect of effects.effects) effects.setEnabled(effect.key, effect.key === key);
+      effects.setShuffle(false);
+      syncEffectButtons();
+      clearPresetState();
+      setStatus(solo ? 'All layers restored.' : `Solo: ${button.textContent.trim()}.`);
+      return;
+    }
     effects.toggleEnabled(key);
     syncEffectButtons();
+    clearPresetState();
     // Turning on a layer that has nothing to draw deserves an explanation.
     if (key === 'dribbles' && effects.isEnabled('dribbles') && dribbleIndex && !dribbleIndex.hasDribbleData) {
       setStatus('This feed records no take-on or carry events — dribble zones and stats stay empty.');
@@ -1451,6 +1841,7 @@ if (els.shuffle) {
   els.shuffle.addEventListener('click', () => {
     effects.toggleShuffle();
     syncEffectButtons();
+    clearPresetState();
   });
 }
 
@@ -1472,11 +1863,57 @@ function hitTestPlayer(canvasX, canvasY) {
   return best;
 }
 
+function hitTestLaneTarget(canvasX, canvasY) {
+  if (!effects.isVisible('passingLanes') || getVariant('passLanes') !== 'corridor') return null;
+  const [bx, by] = toBaseScreen(canvasX, canvasY);
+  let best = null;
+  let bestD = 14 * 14;
+  for (const t of laneTargetHits) {
+    if (!Number.isFinite(t.x) || !Number.isFinite(t.y)) continue;
+    const d = (t.x - bx) * (t.x - bx) + (t.y - by) * (t.y - by);
+    if (d < bestD) { bestD = d; best = t; }
+  }
+  return best;
+}
+
 function hitTestZone(canvasX, canvasY) {
   if (!dribblePanel || !effects.isVisible('dribbles')) return null;
   const [wx, wy] = fromScreen(canvasX, canvasY);
   if (Math.abs(wx) > PITCH_W_M / 2 || Math.abs(wy) > PITCH_H_M / 2) return null;
   return zoneOf(wx, wy, dribblePanel.layerTeam());
+}
+
+function hideLaneTooltip() {
+  if (els.laneTooltip) {
+    els.laneTooltip.hidden = true;
+    els.laneTooltip.innerHTML = '';
+  }
+  hoveredLaneTargetKey = '';
+}
+
+function showLaneTooltip(target, ev) {
+  const tip = els.laneTooltip;
+  if (!tip) return;
+  const key = `${target.team}:${target.shirt}`;
+  if (key !== hoveredLaneTargetKey) {
+    hoveredLaneTargetKey = key;
+    const entry = dribbleIndex ? dribbleIndex.playerByKey(target.team, target.shirt) : null;
+    const strong = document.createElement('strong');
+    strong.textContent = entry ? entry.label : `#${target.shirt}`;
+    const meta = document.createElement('span');
+    meta.className = 'lt-meta';
+    const teamName = target.team === 0 ? 'Home' : 'Away';
+    meta.textContent = `${teamName} · #${target.shirt} · ${Math.round((target.p ?? 0) * 100)}% completion`;
+    tip.innerHTML = '';
+    tip.appendChild(strong);
+    tip.appendChild(meta);
+  }
+  const stageRect = els.stage.getBoundingClientRect();
+  const left = Math.max(4, Math.min(stageRect.width - 190, ev.clientX - stageRect.left + 14));
+  const top = Math.max(4, Math.min(stageRect.height - 58, ev.clientY - stageRect.top + 14));
+  tip.style.left = `${left}px`;
+  tip.style.top = `${top}px`;
+  tip.hidden = false;
 }
 
 function hidePlayerMenu() {
@@ -1521,6 +1958,7 @@ function showPlayerMenu(player, ev) {
   addItem('Show team dribble zones', () => {
     effects.setEnabled('dribbles', true);
     syncEffectButtons();
+    clearPresetState();
     dribblePanel.open('team', { team: player.team });
   });
   if (dribbles.length) {
@@ -1547,6 +1985,7 @@ function showPlayerMenu(player, ev) {
 
 els.canvas.addEventListener('pointerdown', (ev) => {
   if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+  hideLaneTooltip();
   panning = {
     x: ev.clientX, y: ev.clientY,
     panX: view.panX, panY: view.panY, moved: false,
@@ -1569,22 +2008,38 @@ els.canvas.addEventListener('pointermove', (ev) => {
     return;
   }
   const [cx, cy] = pointerToCanvas(ev);
-  const player = hitTestPlayer(cx, cy);
+  const target = hitTestLaneTarget(cx, cy);
+  if (target) showLaneTooltip(target, ev);
+  else hideLaneTooltip();
+  const player = target ? null : hitTestPlayer(cx, cy);
   const key = player ? `${player.team}:${player.shirt}` : '';
   const prevKey = hoveredPlayer ? `${hoveredPlayer.team}:${hoveredPlayer.shirt}` : '';
-  if (key !== prevKey) {
-    hoveredPlayer = player;
-    els.canvas.style.cursor = player ? 'pointer' : 'default';
-  }
-  hoverZone = player ? null : hitTestZone(cx, cy);
+  if (key !== prevKey) hoveredPlayer = player;
+  els.canvas.style.cursor = (target || player) ? 'pointer' : 'default';
+  hoverZone = (target || player) ? null : hitTestZone(cx, cy);
 });
+
+els.canvas.addEventListener('pointerleave', hideLaneTooltip);
 
 els.canvas.addEventListener('pointerup', (ev) => {
   if (!panning) return;
   const moved = panning.moved;
   panning = null;
   if (moved) return; // a drag, not a click
+  hideLaneTooltip();
   const [cx, cy] = pointerToCanvas(ev);
+  const target = hitTestLaneTarget(cx, cy);
+  if (target) {
+    const entry = dribbleIndex ? dribbleIndex.playerByKey(target.team, target.shirt) : null;
+    const label = entry ? entry.label : `#${target.shirt}`;
+    if (entry && dribblePanel) {
+      dribblePanel.open('player', { team: target.team, player: entry.pid });
+      setStatus(`Pass target: ${label} · ${Math.round((target.p ?? 0) * 100)}% completion.`);
+    } else {
+      setStatus(`Pass target: ${label} · ${Math.round((target.p ?? 0) * 100)}% completion.`);
+    }
+    return;
+  }
   const player = hitTestPlayer(cx, cy);
   if (player) {
     showPlayerMenu(player, ev);
@@ -1653,6 +2108,33 @@ if (els.zoneAlpha) {
     if (els.zoneAlphaVal) els.zoneAlphaVal.textContent = `${Math.round(zoneAlpha * 100)}%`;
   });
 }
+if (els.laneHold) {
+  const syncLaneHold = () => {
+    const value = Math.min(6, Math.max(0.5, parseFloat(els.laneHold.value) || 2.4));
+    if (typeof attackLanesFx.setHold === 'function') attackLanesFx.setHold(value);
+    if (els.laneHoldVal) els.laneHoldVal.textContent = `${value.toFixed(1)}s`;
+  };
+  els.laneHold.addEventListener('input', syncLaneHold);
+  syncLaneHold();
+}
+if (els.networkDecay) {
+  try {
+    const stored = parseFloat(localStorage.getItem('gev.networkDecay'));
+    if (Number.isFinite(stored)) {
+      els.networkDecay.value = String(Math.min(600, Math.max(30, stored)));
+    }
+  } catch { /* ignore */ }
+  const syncNetworkDecay = () => {
+    const value = Math.min(600, Math.max(30, parseFloat(els.networkDecay.value) || 180));
+    if (typeof passingNet.setDecay === 'function') passingNet.setDecay(value);
+    if (els.networkDecayVal) {
+      els.networkDecayVal.textContent = value < 60 ? `${Math.round(value)}s` : `${(value / 60).toFixed(1)} min`;
+    }
+    try { localStorage.setItem('gev.networkDecay', String(value)); } catch { /* ignore */ }
+  };
+  els.networkDecay.addEventListener('input', syncNetworkDecay);
+  syncNetworkDecay();
+}
 syncZoomControl();
 
 // Click-away and Escape dismiss the context menu (the panel hides itself
@@ -1670,6 +2152,113 @@ els.playpause.addEventListener('click', () => {
   playing = !playing;
   els.playpause.textContent = playing ? '⏸ Pause' : '▶ Play';
 });
+function syncFreezeHistoryButtons() {
+  const can = Boolean(frozenFrame && possessionHistory.length);
+  if (els.freezePrev) els.freezePrev.disabled = !can || freezeHistoryIndex >= possessionHistory.length - 1;
+  if (els.freezeNext) els.freezeNext.disabled = !can || freezeHistoryIndex <= 0;
+}
+
+function showFreezeHistory(step) {
+  if (!frozenFrame || !possessionHistory.length) return;
+  const next = Math.max(0, Math.min(possessionHistory.length - 1, freezeHistoryIndex + step));
+  if (next === freezeHistoryIndex) return;
+  freezeHistoryIndex = next;
+  frozenFrame.previous = possessionHistory[possessionHistory.length - 1 - freezeHistoryIndex] ?? null;
+  syncFreezeHistoryButtons();
+  setStatus(`Possession ghost ${freezeHistoryIndex + 1} of ${possessionHistory.length}.`);
+}
+
+if (els.freezePrev) els.freezePrev.addEventListener('click', () => showFreezeHistory(1));
+if (els.freezeNext) els.freezeNext.addEventListener('click', () => showFreezeHistory(-1));
+
+if (els.freezeFrame) {
+  els.freezeFrame.addEventListener('click', () => {
+    if (frozenFrame) {
+      frozenFrame = null;
+      els.freezeFrame.textContent = '❄ Freeze frame';
+      syncFreezeHistoryButtons();
+      setStatus('Frame comparison cleared.');
+      return;
+    }
+    if (!lastPlayers.length) return;
+    const at = typeof engine?.get_sim_time === 'function' ? engine.get_sim_time() : 0;
+    frozenFrame = {
+      time: at,
+      ball: lastBall ? { x: lastBall.x, y: lastBall.y } : null,
+      players: lastPlayers.map((p) => ({ x: p.x, y: p.y, team: p.team, shirt: p.shirt })),
+      previous: possessionHistory[possessionHistory.length - 1 - freezeHistoryIndex] ?? null,
+      lanes: effects.isVisible('passingLanes') ? lastRenderedLanes.map((lane) => ({ ...lane })) : [],
+      vision: effects.isVisible('visionCone') && lastVisionCone
+        ? {
+            apex: { ...lastVisionCone.apex },
+            facing: lastVisionCone.facing,
+            radius: lastVisionCone.radius,
+            conePoints: (lastVisionCone.conePoints ?? []).map((pt) => ({ x: pt.x, y: pt.y })),
+          }
+        : null,
+    };
+    els.freezeFrame.textContent = '❄ Unfreeze';
+    syncFreezeHistoryButtons();
+    setStatus(`Frame frozen at ${formatClock(at)}${frozenFrame?.previous ? ` · possession ghost ${freezeHistoryIndex + 1}/${possessionHistory.length}` : ''} — live play continues.`);
+  });
+}
+
+function exportPitchPng() {
+  const src = els.canvas;
+  const bar = 40;
+  const out = document.createElement('canvas');
+  out.width = src.width;
+  out.height = src.height + bar;
+  const octx = out.getContext('2d');
+  octx.drawImage(src, 0, 0);
+  octx.fillStyle = '#0d1117';
+  octx.fillRect(0, src.height, src.width, bar);
+  octx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
+  octx.textBaseline = 'middle';
+  const y = src.height + bar / 2;
+  const items = [
+    ['#f2f2f2', 'Home'],
+    ['#2f81f7', 'Away'],
+    ['#ffea00', 'Ball'],
+    ['#78dcff', 'Pass lane'],
+    ['#ffbe5a', 'Run lane'],
+    ['#50dcb4', 'Vision'],
+  ];
+  let x = 16;
+  for (const [color, label] of items) {
+    octx.fillStyle = color;
+    octx.beginPath();
+    octx.arc(x + 4, y, 4, 0, Math.PI * 2);
+    octx.fill();
+    octx.fillStyle = '#c9d1d9';
+    octx.textAlign = 'left';
+    octx.fillText(label, x + 13, y + 0.5);
+    x += 13 + octx.measureText(label).width + 18;
+  }
+  const clock = typeof engine?.get_sim_time === 'function' ? formatClock(engine.get_sim_time()) : '—';
+  const home = els.homeName?.textContent || 'Home';
+  const away = els.awayName?.textContent || 'Away';
+  const suffix = frozenFrame ? ' · frozen frame' : '';
+  const title = `${home} vs ${away} · ${clock}${suffix}`;
+  octx.fillStyle = '#8b949e';
+  octx.textAlign = 'right';
+  octx.fillText(title, src.width - 16, y + 0.5);
+  return out.toDataURL('image/png');
+}
+
+if (els.exportFrame) {
+  els.exportFrame.addEventListener('click', () => {
+    const clock = typeof engine?.get_sim_time === 'function' ? formatClock(engine.get_sim_time()) : 'frame';
+    const a = document.createElement('a');
+    a.href = exportPitchPng();
+    a.download = `gev-${String(clock).replace(/[^\w-]+/g, '-')}.png`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setStatus('Current pitch frame exported as PNG with legend.');
+  });
+}
+
 els.restart.addEventListener('click', () => {
   if (lastXml) { try { startEngine(lastXml); } catch (e) { setStatus(String(e)); } }
 });
@@ -1706,6 +2295,12 @@ function seekTo(target, message) {
   const dur = engine.get_duration_secs();
   const clamped = Math.max(0, Math.min(dur, target));
   engine.seek_to(clamped);
+  frozenFrame = null;
+  possessionHistory = [];
+  freezeHistoryIndex = 0;
+  lastRenderedLanes = [];
+  if (els.freezeFrame) els.freezeFrame.textContent = '❄ Freeze frame';
+  syncFreezeHistoryButtons();
   lastEventSeq = -1;
   resetSequenceCursor();
   resetOverlayState();
@@ -1719,7 +2314,7 @@ function seekTo(target, message) {
   fx.reset();
   momentum.reset();
   passingNet.reset();
-  passingLanes.reset();
+  attackLanesFx.reset();
   attackChannelsFx.reset();
   playerHeat.reset();
   chosenPlayerShirt = null;
@@ -1727,13 +2322,14 @@ function seekTo(target, message) {
   lastPlayerHeatTeam = -1;
   lastPlayerHeatSample = -Infinity;
   lastLaneCompute = -Infinity;
-  lastLaneData = [];
+  lastAttackLanes = { active: false, lanes: [], bestPass: null };
   lastChannelCompute = -Infinity;
   lastChannelData = [];
+  networkPulse = null;
   playerVelocity.clear();
   visionAlpha = 0;
-  lastVisionCarrier = '';
   lastVisionCone = null;
+  lastVisionField = null;
   visionFocus = null;
   if (highlighter) { highlighter.buffer.length = 0; }
   lastPasser[0] = { id: '', pos: null };
@@ -1906,9 +2502,20 @@ async function main() {
 window.__gev = {
   get engine() { return engine; },
   get players() { return lastPlayers; },
+  get ball() { return lastBall; },
   get panel() { return dribblePanel; },
   get index() { return dribbleIndex; },
   get view() { return view; },
+  get networkMode() { return getVariant('network') === 'mesh' ? 'mesh' : 'outlet'; },
+  get network() { return passingNet; },
+  get networkPulse() { return networkPulse; },
+  get vision() { return { cone: lastVisionCone, field: lastVisionField, focus: visionFocus, alpha: visionAlpha }; },
+  get attackLanes() { return lastAttackLanes; },
+  get laneFx() { return attackLanesFx; },
+  get attackChannels() { return lastChannelData; },
+  get channelFx() { return attackChannelsFx; },
+  get displayTeam() { return displayTeam; },
+  get teamBlend() { return teamBlend; },
   toScreen,
   seekTo,
 };

@@ -54,6 +54,7 @@ export function createAttackChannelTracker(options = {}) {
           blur: 0,
           score: channel.score ?? 0.5,
           curve: channel.curve ?? 0,
+          landing: channel.landing ?? null,
         };
         entries.set(key, e);
       }
@@ -67,6 +68,7 @@ export function createAttackChannelTracker(options = {}) {
       e.to.y += (e.target.y - e.to.y) * k;
       e.score = channel.score ?? e.score;
       e.curve = channel.curve ?? 0;
+      e.landing = channel.landing ?? null;
       e.growth = Math.min(1, e.growth + step / growIn);
       e.alpha = Math.min(1, e.alpha + step / (growIn * 0.8));
       e.blur = Math.max(0, e.blur - (step / fadeOut) * maxBlur);
@@ -88,6 +90,7 @@ export function createAttackChannelTracker(options = {}) {
       blur: e.blur,
       score: e.score,
       curve: e.curve,
+      landing: e.landing,
     }));
   }
 

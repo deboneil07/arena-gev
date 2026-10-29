@@ -9,6 +9,10 @@ web/
 ├── app.js             # fixed-step loop + Canvas drawing (Float32Array view)
 ├── analysis.js        # pure tactical geometry (roles, shape units, triangles)
 ├── analysis.test.mjs  # Node unit tests for the geometry maths
+├── attackLanes.js     # live four-channel tracker (grow, score easing, pass pulse)
+├── attackLanes.test.mjs
+├── attackChannels.js  # live run-channel tracker (grow, fade, landing glow)
+├── attackChannels.test.mjs
 ├── heatmap.js         # pure cumulative team heatmap (density grid)
 ├── heatmap.test.mjs
 ├── overlays.js        # Canvas drawing for the team overlays
@@ -17,6 +21,12 @@ web/
 ├── graphs.test.mjs
 ├── effects.js         # analytical layer toggles + shuffle state
 ├── effects.test.mjs
+├── presets.js         # Broadcast / Tactical / Clean layer presets + storage
+├── presets.test.mjs
+├── variants.js        # persisted render-variant catalog for the Variant lab
+├── variants.test.mjs
+├── fieldThemes.js     # pitch palettes for the field variants
+├── fieldThemes.test.mjs
 ├── dribbles.js        # pure dribble analysis (zones, stats, live window, insights)
 ├── dribbles.test.mjs
 ├── dribbleOverlay.js  # Canvas drawing for the 12-zone dribble heat layer
@@ -80,8 +90,13 @@ Three ways, in order of convenience:
 3. **”Load XML” button** — pick any local `.xml` file with the OS file dialog
    (works without copying it into the served folder).
 
-The controls also give you **Pause/Play**, **Restart**, and a **0.25×–8× speed**
-slider. The HUD shows match time, FPS, entity count and ball altitude, plus a
+The controls also give you **Pause/Play**, **Restart**, a **0.25×–8× speed**
+slider, and **Freeze frame**: the current bodies, pass lanes and vision cone stay as dashed
+ghosts while live play continues, so you can compare the shape before and after
+a change. Once the match has changed hands, the previous possession is drawn
+as an extra faint ghost underneath; the ◀/▶ buttons step back through up to
+four recent possessions. **Export frame** downloads the current pitch view with a burned-in
+legend and match clock as a PNG. The HUD shows match time, FPS, entity count and ball altitude, plus a
 team pill naming the side currently being analysed and its formation.
 
 ## Live event feed & splash
@@ -120,10 +135,16 @@ independently from the effects bar above the pitch.
   triangle joining the three unit centroids. DEF / MID / ATT are colour-coded
   and labelled at the end of each segment. A unit with one player shows a dot
   instead of a line; the triangle only appears when all three units exist.
-- **Passing network** — nodes at each player's average touch position, sized
-  by passes made; the eight strongest links are drawn with width and opacity
-  scaled by pass count. Nodes carry shirt numbers only. Only the followed
-  team's network is drawn.
+- **Passing network** — the default mode draws exactly one wire per player:
+  his most-used teammate in the current run of possession. Width scales with
+  the count, a bead pulses along the wire when the pass is made, node size
+  tracks involvement in that possession, and the whole shape clears on a
+  turnover. The **Full mesh** variant in the Variant lab restores the match-long
+  complete web: every shirt is a node and every pair is a link, zero-pass
+  pairs are a faint thread, and the strongest channel is drawn on top.
+  Mesh link weight decays with a three-minute time constant: a pair that stops
+  combining thins back toward the default faint thread, while a fresh pass
+  refreshes the timestamp and thickens it again.
 - **Live heatmap** — a cumulative density map of the followed team's
   positions from load/seek onward, sampled every 0.25 s of match time. Home
   uses a warm ramp, away a cool ramp; the soft wash is confined to the pitch
@@ -131,23 +152,38 @@ independently from the effects bar above the pitch.
   position.
 - **Momentum strip** — sidebar canvas: cumulative model-estimate threat per
   team with goal/shot/card ticks.
-- **Passing lanes** — live arrows from the ball to the best receivers. The
-  geometry is re-scored at 10 Hz and the endpoints resolve every frame, so
-  the arrow stays attached to the moving ball and receiver. Each lane grows
-  from the ball, with opacity/width driven by a logistic completion
-  probability (corridor clearance, distance, receiver pressure, xT gain).
+- **Pass lanes** — four 17 m horizontal channels on the opposition half,
+  drawn only for the team in possession once the carrier is past halfway. The
+  lane the carrier's velocity and acceleration project into burns brightest;
+  the other lanes brighten by the best viable pass into them, and the carrier's
+  current lane keeps a baseline. Lanes grow from halfway and **hold for 2.4 s
+  (adjustable with the Lane memory slider)** after possession changes, then
+  fade as ghosts, so a pass or turnover reads as a handover rather than a
+  vanish. The default **Corridor** variant marks the best receiving shirt and
+  its completion probability at the end of each lane; hovering that chip previews the receiver and click
+  opens the receiver's player analysis; the chip follows the live player. **Classic** keeps the original travelling
+  pass pulse.
 - **Run channels** — live 6–12 m forward runs the attackers should make
   during a progression, scored by xT gain and the time gained on the nearest
-  defender. The arrow is anchored to the runner, its weight scales with the
-  score, bows away from the nearest defender, and grows from a point with an
-  eased extension.
-- **Vision cone** — a translucent sector for the carrier. Every player has a
-  stable individual profile: radius 16–28 m and half-angle 48–72° (deterministic
-  from team + shirt), so narrow and wide-vision players read differently. The
-  cone faces the best available pass (not the ball at the carrier's feet).
-  Teammates in the cone with a clear sightline are joined in teal; the rest
-  of the near circle is the blind sector with dotted red links. Occlusion by
-  an opponent downgrades a teammate to blind.
+  defender. The default **Lanes** variant draws a wide arrow-free corridor with
+  a calm centreline; other variants keep the legacy arrows, landing blobs,
+  player trails or a thin trace. The landing zone still tints gold when the
+  endpoint reaches the attacking half.
+- **Vision** — two layers for the carrier, both sized by **role**, not by a
+  random draw. The near layer is the familiar cone and blind circle
+  (GK 26 m / 80°, DEF 24 m / 70°, MID 22 m / 62°, FWD 20 m / 54°). The long
+  layer is a raycast field: GK 58 m, DEF 44 m, MID 36 m, FWD 30 m. Opponents
+  block the sightline; a keeper is additionally screened by his own
+  defenders. The near cone and the long field share an angular falloff:
+  brightness peaks at the facing direction and fades toward the rim. The rate
+  is role-shaped — the keeper keeps a high rim value (a floodlight, near
+  all-round awareness), each line forward steepens it, and a forward reads as
+  a tight torch. Distance falloff and the crisp raycast shadows stay on top.
+  Teammates with a clear sightline are joined in teal; the rest are dotted
+  red. The cone faces the best available pass (not the ball at the carrier's
+  feet). The default **Soft wedge** skin drops the teammate lines and the
+  long-field shadows; **Spotlight**, **Minimal outline** and **Classic** remain
+  selectable in the Variant lab.
 - **Player heat** — the analysis minimap sometimes shows a randomly chosen
   player's cumulative heat (rotates every 45 s, resets with the followed team).
 - **Scripted sequences** — goal mob, save puff, woodwork ping, card/penalty
@@ -155,19 +191,39 @@ independently from the effects bar above the pitch.
 
 The passing network is anchored to the live player positions and shows while
 the followed team still has the ball, after at least three consecutive passes.
-A sustained interception breaks the retained sequence immediately (the layer
-hides as soon as possession is lost). A new pair's link is almost invisible and
-darkens only as those two players keep exchanging the ball (absolute pass
-count, not relative to the strongest link).
+A sustained interception clears the retained sequence immediately (the layer
+hides as soon as possession is lost). In the default outlet mode the network
+describes only the current possession: each player has one wire to his
+most-used teammate, and the window empties on a turnover. **Full mesh** keeps
+the match-long cumulative web instead: every shirt is a node and every pair is
+a link — zero-pass pairs are a faint thread, and a pair darkens only as those
+two players keep exchanging the ball (absolute pass count, not relative to the
+strongest link).
+
+The offside line is a reference, not a fixture: it is shown only while it says
+something. It hides when the back line is camped within 15 m of the goal it
+defends (the line sits on the box, with no space behind it), when the line
+merely repeats the ball position (the ball is beyond the second-last defender),
+and when no attacker is within 18 m of it. Set pieces hide it too, and a 0.5 s
+dwell keeps a drifting line from strobing.
 
 ### Effect toggles & shuffle
 
 The effects bar above the pitch controls each analytical layer independently:
-**Heatmap**, **Passing network**, **Offside line**, **Analysis** (carrier ring,
-THREAT arrow/text, press ring and defensive hull), **Pass lanes**, **Run
-channels**, **Vision cone** and **Dribbles**. All are on by default, so the
-initial view is
-unchanged. Hiding a layer only skips its draw call: the samplers and trackers
+**Heatmap**, **Passing network**, **Offside line**, **Carrier & shape** (carrier
+ring, threat label, press ring and defensive hull), **Pass lanes**, **Run
+channels**, **Vision cone** and **Dribbles**. The app starts on the
+**Tactical** preset (all spatial layers except dribble zones); **All** turns
+every layer on.
+**Shift-click** any layer to solo it; shift-click again restores every layer. Preset and variant choices are both stored in `localStorage`.
+The **Lane memory** slider under the pitch controls how long pass lanes linger
+after possession changes. **Network memory** controls the passing-network
+decay constant; shorter values thin old links faster.
+
+The **Presets** control switches coherent layer sets: **Broadcast** (heatmap,
+carrier shape, offside), **Tactical** (the full spatial stack), **Clean** (no
+overlays) and **All**. The passing network's outlet/mesh choice now lives in
+the Variant lab rather than a separate button. Hiding a layer only skips its draw call: the samplers and trackers
 keep running, so switching it back on resumes the live state instead of
 resetting it. Toggle choices persist across seeks, restarts and match loads.
 
@@ -176,6 +232,18 @@ every 4 seconds, wrapping through the enabled set. The current layer's button
 is highlighted. Turning Shuffle off restores the normal view for every enabled
 toggle. Disabling the layer currently on screen moves Shuffle to the next
 enabled layer; if no layers are enabled, Shuffle shows nothing.
+
+### Variant lab
+
+The **Lab** button (or `?lab=1` in the URL) opens the Variant lab. The lab swaps renderings without touching
+the analysis maths. Vision cone has classic, soft-wedge, spotlight and outline
+skins. Pass lanes has classic, dot-free, corridor-target and ghost-trail
+versions; Corridor draws the receiving shirt and completion probability at the
+lane end. Run channels has arrows, arrow-free lanes, landing blobs, player
+trails and a thin trace. Heatmap has raster and hex-bin outputs; field has
+classic, broadcast and night palettes; analysis has a minimal carrier-and-hull
+mode. The recommended defaults are soft-wedge, corridor and lanes. Selections
+are stored in `localStorage`, and **Reset to recommended** restores them.
 
 Set-piece robustness: a corner holds the ball at the flag while the box fills.
 If the feed includes a delivery pass, that cross is used; if the synthetic feed
@@ -256,6 +324,9 @@ per-player lens is open.
   (click a row to select that zone), the ✓/✗/○ effectiveness scale, rule-based
   insights and the squad list (click a player to switch lenses). A feed with no
   dribble events shows a single explanatory note instead of empty charts.
+- **Live vision** — while this player is on the ball, the panel shows their
+  current field-of-view coverage, visible/blind teammate counts and best pass
+  option. The block updates live without rebuilding the rest of the panel.
 - **Player lens** — four percentile metrics vs team-mates with ≥2 dribbles
   (attempts, success rate, gain, shot-after rate) with star ratings; a
   **per-zone circle map** where circle *size* = attempts, *fill* = success

@@ -45,6 +45,38 @@
       box-shadow: inset 0 0 0 1px #ffbe5a;
     }
     #effects .effect-sep { width: 1px; height: 16px; background: #30363d; margin: 0 2px; }
+    #effects .seg { border-radius: 8px; }
+    #effects .seg .seg-btn { border-radius: 6px; padding: 4px 10px; }
+    #effects .seg .seg-btn[aria-pressed="true"] {
+      background: #2f81f7; color: #fff; border-color: #2f81f7;
+    }
+
+    .variant-lab-details { margin: 8px auto 14px; max-width: 980px; color: #8b949e; font-size: 12px; }
+    .variant-lab-details summary {
+      cursor: pointer; text-align: center; list-style: none; padding: 4px 0;
+    }
+    .variant-lab-details summary::-webkit-details-marker { display: none; }
+    .variant-lab-details summary::before { content: "▸ "; }
+    .variant-lab-details[open] summary::before { content: "▾ "; }
+    .variant-lab {
+      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 20px;
+      margin-top: 10px; padding: 12px 14px; background: #0d1117;
+      border: 1px solid #21262d; border-radius: 10px;
+    }
+    .variant-lab-head {
+      grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between;
+      gap: 10px; color: #6e7681; padding-bottom: 6px; border-bottom: 1px solid #21262d;
+    }
+    .variant-reset {
+      padding: 4px 10px; font-size: 11.5px; color: #8b949e; background: #161b22;
+      border: 1px solid #30363d; border-radius: 6px;
+    }
+    .variant-reset:hover { color: #e6edf3; border-color: #58a6ff; }
+    .variant-row { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+    .variant-row-label { color: #c9d1d9; font-weight: 600; }
+    .variant-row .seg { flex-wrap: wrap; }
+    .variant-row .seg-btn { padding: 3px 8px; font-size: 11px; }
+    @media (max-width: 700px) { .variant-lab { grid-template-columns: 1fr; } }
     #effects #shuffle-effects[aria-pressed="true"] {
       border-color: #ffbe5a; color: #ffbe5a; background: rgba(255, 190, 90, 0.12);
     }
@@ -202,6 +234,7 @@
 
     :focus-visible { outline: 2px solid #2f81f7; outline-offset: 2px; }
 
+
     /* ── Dribble analysis: view controls under the pitch ─────── */
     #view-controls {
       display: flex; gap: 16px; align-items: center; flex-wrap: wrap; justify-content: center;
@@ -212,6 +245,13 @@
     #view-controls button { font-size: 11.5px; padding: 4px 10px; }
     #view-controls .val { color: #c9d1d9; font-variant-numeric: tabular-nums; min-width: 42px; }
     #view-controls .vc-sep { width: 1px; height: 14px; background: #30363d; }
+
+    .analysis-readout {
+      margin-top: 6px; min-height: 16px; text-align: center;
+      font-size: 11.5px; color: #8b949e; font-variant-numeric: tabular-nums;
+    }
+    .analysis-readout strong { color: #c9d1d9; font-weight: 600; }
+    .analysis-readout .ro-sep { color: #30363d; margin: 0 7px; }
 
     /* Two-state segmented control: stats window in the panel and under the
        pitch. Shares one look so the two placements read as one control. */
@@ -244,6 +284,16 @@
       border: 0; color: #c9d1d9; font-size: 12.5px; padding: 7px 8px; border-radius: 6px;
     }
     #player-context button:hover { background: #2f81f7; color: #fff; }
+
+    .lane-tooltip {
+      position: absolute; z-index: 24; pointer-events: none;
+      background: rgba(13, 17, 23, 0.96); border: 1px solid #30363d;
+      border-radius: 6px; padding: 6px 9px; font-size: 11.5px; color: #c9d1d9;
+      line-height: 1.5; white-space: nowrap; box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+    }
+    .lane-tooltip[hidden] { display: none; }
+    .lane-tooltip strong { color: #e6edf3; display: block; }
+    .lane-tooltip .lt-meta { color: #8b949e; font-variant-numeric: tabular-nums; }
 
     /* ── Analysis panel: right slide-in (bottom sheet on small) ─ */
     #player-panel {
@@ -416,6 +466,16 @@
       }
       #player-panel.is-open { transform: none; }
     }
+    @media (max-width: 700px) {
+      #effects { gap: 4px; }
+      #effects button { min-height: 34px; }
+      #effects .seg { width: 100%; justify-content: center; }
+      #effects .seg .seg-btn { min-height: 32px; }
+      #view-controls label { flex: 1 1 100%; justify-content: space-between; }
+      #view-controls input[type="range"] { flex: 1; }
+      #freeze-prev, #freeze-next { min-width: 36px; }
+      .analysis-readout { font-size: 10.5px; line-height: 1.45; padding: 0 4px; }
+    }
     @media (prefers-reduced-motion: reduce) {
       #player-panel { transition: none; }
       #feed .row { animation: none; }
@@ -441,6 +501,10 @@
     <button id="playpause">⏸ Pause</button>
     <button id="fwd5">⏩ 5 min</button>
     <button id="restart" disabled>↺ Restart</button>
+    <button id="freeze-frame" disabled title="Freeze this frame as a ghost while play continues">❄ Freeze frame</button>
+    <button id="freeze-prev" disabled title="Show the older possession ghost" aria-label="Older possession ghost">◀</button>
+    <button id="freeze-next" disabled title="Show the newer possession ghost" aria-label="Newer possession ghost">▶</button>
+    <button id="export-frame" disabled title="Download the current pitch view as a PNG">⤓ Export frame</button>
     <label class="file">📂 Load XML<input type="file" id="file" accept=".xml,text/xml" /></label>
     <label>Speed
       <input type="range" id="speed" min="0.25" max="8" step="0.25" value="1" />
@@ -453,7 +517,7 @@
     <button id="browse" title="Pick a folder and choose an .xml from it">📁 Browse folder</button>
   </div>
   <div id="effects" role="group" aria-label="Analytical effects">
-    <span class="effects-label">Effects</span>
+    <span class="effects-label" title="Shift-click a layer to solo it">Effects</span>
     <button type="button" class="effect-toggle" data-effect="heatmap" aria-pressed="true"
       title="Cumulative team heatmap">Heatmap</button>
     <button type="button" class="effect-toggle" data-effect="network" aria-pressed="true"
@@ -461,11 +525,11 @@
     <button type="button" class="effect-toggle" data-effect="offside" aria-pressed="true"
       title="Offside line">Offside line</button>
     <button type="button" class="effect-toggle" data-effect="analysis" aria-pressed="true"
-      title="Carrier ring, THREAT arrow/text, press ring and defensive hull">Analysis</button>
+      title="Carrier ring, threat label, press ring and defensive hull">Carrier &amp; shape</button>
     <button type="button" class="effect-toggle" data-effect="passingLanes" aria-pressed="true"
-      title="Passing lanes to the best receivers">Pass lanes</button>
+      title="Attacking channels with pass probability and target">Pass lanes</button>
     <button type="button" class="effect-toggle" data-effect="attackChannels" aria-pressed="true"
-      title="Forward run channels">Run channels</button>
+      title="Forward run corridors, arrows or landing zones">Run channels</button>
     <button type="button" class="effect-toggle" data-effect="visionCone" aria-pressed="true"
       title="Visible and blind vision sectors">Vision cone</button>
     <button type="button" class="effect-toggle" data-effect="dribbles" aria-pressed="true"
@@ -473,7 +537,20 @@
     <span class="effect-sep" aria-hidden="true"></span>
     <button type="button" id="shuffle-effects" aria-pressed="false"
       title="Show one enabled analytical effect at a time">🔀 Shuffle effects</button>
+    <span class="effect-sep" aria-hidden="true"></span>
+    <button type="button" id="lab-toggle" class="effect-toggle" aria-pressed="false"
+      title="Show or hide the render-variant lab">Lab</button>
+    <div class="seg" id="presets" role="group" aria-label="Analysis preset">
+      <button type="button" class="seg-btn" data-preset="broadcast" title="Heatmap, carrier shape and offside line">Broadcast</button>
+      <button type="button" class="seg-btn" data-preset="tactical" title="Full tactical stack">Tactical</button>
+      <button type="button" class="seg-btn" data-preset="clean" title="Hide every analytical layer">Clean</button>
+      <button type="button" class="seg-btn" data-preset="all" title="Every analytical layer on">All</button>
+    </div>
   </div>
+  <details id="variant-lab-details" class="variant-lab-details" hidden>
+    <summary>Variant lab</summary>
+    <div id="variant-lab" class="variant-lab"></div>
+  </details>
   <div id="filelist"></div>
   <div id="status"></div>
 
@@ -491,6 +568,7 @@
         <div class="ht-sub">Second half kicks off shortly</div>
       </div>
       <div id="player-context" role="menu" aria-label="Player actions" hidden></div>
+      <div id="lane-tooltip" class="lane-tooltip" role="status" hidden></div>
       <div id="view-controls">
         <label>Zoom
           <input type="range" id="zoom" min="1" max="2.5" step="0.05" value="1"
@@ -504,6 +582,16 @@
             aria-label="Dribble zone layer opacity" />
           <span class="val" id="zone-alphaval">55%</span>
         </label>
+        <label>Lane memory
+          <input type="range" id="lane-hold" min="0.5" max="6" step="0.1" value="2.4"
+            aria-label="How long pass lanes stay after possession changes" />
+          <span class="val" id="lane-holdval">2.4s</span>
+        </label>
+        <label>Network memory
+          <input type="range" id="network-decay" min="30" max="600" step="15" value="180"
+            aria-label="Passing network link memory in seconds" />
+          <span class="val" id="network-decayval">3.0 min</span>
+        </label>
         <div class="vc-window">
           <span class="vc-sep" aria-hidden="true"></span>
           <div class="seg" role="group" aria-label="Stats time window">
@@ -512,6 +600,7 @@
           </div>
         </div>
       </div>
+      <div id="analysis-readout" class="analysis-readout" aria-live="polite"></div>
     </div>
     <aside id="sidebar">
       <h2>Live Events</h2>
@@ -547,10 +636,10 @@
     <span class="legend-sep"></span>
     <span><i class="line-swatch" style="border-top-color:#7ee7ff"></i>Analysis</span>
     <span><i class="line-swatch offside"></i>Offside</span>
-    <span><i class="line-swatch" style="border-top-color:#78dcff"></i>Pass lane · model prob.</span>
-    <span><i class="line-swatch" style="border-top-color:#ffbe5a;border-top-style:dashed"></i>Run channel</span>
-    <span><i class="line-swatch" style="border-top-color:#50dcb4"></i>Vision</span>
-    <span><i class="line-swatch" style="border-top-color:#ff6e6e;border-top-style:dotted"></i>Blind</span>
+    <span><i class="line-swatch" style="border-top-color:#78dcff"></i>Pass lane · prob. + target</span>
+    <span><i class="line-swatch" style="border-top-color:#ffbe5a;border-top-style:dashed"></i>Run lane</span>
+    <span><i class="line-swatch" style="border-top-color:#50dcb4"></i>Vision field</span>
+    <span><i class="line-swatch" style="border-top-color:#ff6e6e;border-top-style:dotted"></i>Blind side</span>
     <span><i class="swatch" style="background:#b478ff"></i>Player heat</span>
     <span><i class="heat-swatch"></i>Heat · match so far</span>
     <span class="legend-sep"></span>
@@ -560,6 +649,6 @@
     <span><i class="heat-swatch" style="background:linear-gradient(90deg, rgba(80,220,140,0.75), rgba(230,199,74,0.75), rgba(239,75,75,0.75))"></i>Zones · dribble volume</span>
   </div>
 
-  <script type="module" src="./app.js?v=19"></script>
+  <script type="module" src="./app.js?v=27"></script>
 </body>
 </html>
